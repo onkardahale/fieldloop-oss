@@ -43,8 +43,11 @@ jobs:
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
+        # Apple Silicon (arm64) only. The Intel (macos-13/x86_64) hosted runner is so
+        # scarce it left the release job queued for an hour, blocking every wheel — so it
+        # is dropped; Intel-mac users build from the sdist. Re-add a `{runner: macos-13,
+        # target: x86_64}` line here if those runners free up.
         include:
-          - { runner: macos-13, target: x86_64 }
           - { runner: macos-14, target: aarch64 }
     steps:
       - uses: actions/checkout@v4
