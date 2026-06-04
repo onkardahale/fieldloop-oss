@@ -1,0 +1,20 @@
+[package]
+name = "fieldloop-adapter"
+description = "Fieldloop embodiment-adapter SDK: the trait a robot type implements plus a conformance harness that mechanically validates any adapter against the contract."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+fieldloop-types = { workspace = true }
+fieldloop-config = { path = "../fieldloop-config" }
+
+[dev-dependencies]
+# Only the JSON parser, used by the Cosmos-adapter test to prove a pre-generated Cosmos
+# export can arrive as JSON and deserialize into the same fixtures the in-memory path
+# uses. serde_json is already a pinned workspace dependency (used across the repo), so
+# this adds nothing new to the audited surface and stays a test-only dependency.
+serde_json = { workspace = true }

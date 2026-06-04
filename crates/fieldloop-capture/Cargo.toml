@@ -1,0 +1,35 @@
+[package]
+name = "fieldloop-capture"
+description = "Fieldloop on-robot capture SDK core: the non-blocking, in-control-loop hot path that mints rollout ids and hands compact records to an off-loop drain."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Only the canonical schema types plus the Rust std library. The hot path stays
+# small and auditable: no async runtime, no external concurrency crates — the
+# bounded queue and clock all come from std.
+fieldloop-types = { workspace = true }
+# Build a BootId from the OS-sourced boot-session bytes. The boot id is resolved once
+# at construction (off the hot path), so this only participates in setup, never in the
+# 50Hz read loop. "v7" is pulled by the schema crate already; we use from_bytes here.
+uuid = { version = "1" }
+
+# Serialize each drained Rollout to its canonical one-line JSON for the durable rollout
+# sink. This runs only on the drain side (off the 50Hz loop), so JSON encoding never
+# touches the control loop. The byte-for-byte form must match what the deployed agent
+# parses back with serde_json::from_str::<Rollout>, so we reuse the exact serializer the
+# agent reads with rather than hand-rolling a JSON writer that could drift from it.
+serde_json = { workspace = true }
+
+# Read macOS/iOS `kern.boottime` via sysctl(2) to source a real boot-session id from the
+# OS. Platform-gated so non-Apple targets never compile or link it.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# The rollout-sink round-trip tests write JSONL into a throwaway directory that is
+# cleaned up on drop, so they leave no files behind and need no external storage.
+tempfile = "3"

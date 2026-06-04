@@ -1,0 +1,14 @@
+[package]
+name = "fieldloop-trigger"
+description = "Fieldloop failure-trigger, labeling, and selective-upload subsystem: pure, in-memory logic that decides which rollouts/outcomes are interesting enough to pull the heavy sensor payload for, tags them, breaks the train-on-your-own-triggers feedback loop, and prioritizes scarce human review. No DB, no network."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The frozen canonical schema this subsystem inspects and tags (Rollout /
+# OutcomeEvent / OutcomeKind / FailureClass and the id newtypes). Triggers and
+# labels point back at these ids; the human label maps onto FailureClass.
+fieldloop-types = { workspace = true }

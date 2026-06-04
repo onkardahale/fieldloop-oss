@@ -1,0 +1,52 @@
+# Fieldloop — virtual workspace root.
+#
+# This is a *virtual* manifest (no [package] here): the root only wires the
+# members together and pins the shared dependency versions in one place so every
+# future crate (capture SDK, sidecar, ingest gateway, JOIN engine, ...) inherits
+# identical, audited versions via `dep.workspace = true`.
+
+[workspace]
+resolver = "2"
+members = ["crates/fieldloop-adapter", "crates/fieldloop-agent", "crates/fieldloop-capture", "crates/fieldloop-config", "crates/fieldloop-curation", "crates/fieldloop-join", "crates/fieldloop-py", "crates/fieldloop-recorder", "crates/fieldloop-schemaver", "crates/fieldloop-store", "crates/fieldloop-trigger", "crates/fieldloop-types"]
+
+# Shared package metadata inherited by member crates via `field.workspace = true`.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["onkardahale"]
+repository = "https://github.com/onkardahale/fieldloop-oss"
+
+# Shared, pinned dependencies. Kept intentionally minimal (invariant 6 —
+# untrusted-by-default — favors a small, auditable dependency surface). Future
+# crates pull these with `serde.workspace = true`, etc.
+[workspace.dependencies]
+# Serialization for the wire/storage form of every schema type.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# UUIDv7 ids (invariant 2: uniqueness + coarse sort only; embedded ts is advisory).
+# "v7" enables Uuid::now_v7(); "serde" lets ids ride the wire form.
+uuid = { version = "1", features = ["v7", "serde"] }
+# Ergonomic, derive-based error types for the id parse error (and future crates).
+thiserror = "1"
+# The local schema crate, shared so config can reference the canonical outcome
+# kinds / failure classes instead of re-declaring them.
+fieldloop-types = { path = "crates/fieldloop-types" }
+# The storage layer, pinned once here so every reader inherits the same fail-closed
+# tenant query builder (the read API scopes every read through it).
+fieldloop-store = { path = "crates/fieldloop-store" }
+# TOML parsing for the typed, load-time-validated config layer.
+toml = "0.8"
+# Wraps a serde deserialize error with the key path that triggered it, so a config
+# error names the exact offending TOML key instead of a generic "invalid data".
+serde_path_to_error = "0.1"
+# Async HTTP framework for the cloud ingest gateway. Pinned here so every future
+# cloud service (REST/gRPC API, admin) inherits one audited axum version.
+axum = "0.8"
+# Async runtime for the gateway. "rt-multi-thread" + "macros" give the multi-thread
+# scheduler and the `#[tokio::main]`/`#[tokio::test]` attributes; "signal" lets the
+# server install a Ctrl-C/SIGTERM handler for graceful shutdown.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# In-process request dispatch (`ServiceExt::oneshot`) so gateway tests drive the
+# real router without binding a TCP port.
+tower = "0.5"

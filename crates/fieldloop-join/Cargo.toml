@@ -1,0 +1,52 @@
+[package]
+name = "fieldloop-join"
+description = "Fieldloop JOIN + attribution engine: pure, in-memory logic that binds each deployed-policy decision (Rollout) to its delayed, often-implicit real-world OutcomeEvent, producing calibrated Feedback bindings. No DB, no I/O — fully testable."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Default build is the PURE engine only: no DB, no network, so the offline closed-loop
+# gate compiles it without `async-nats` or the live ClickHouse client.
+default = []
+# Opt-in real join WORKER (`src/worker.rs`): subscribes to the gateway's NATS landed
+# events and runs the canonical reward join against a live ClickHouse for each event. Pulls
+# in `async-nats`, `futures`, the store crate's `live-db` ClickHouse client, and a Tokio
+# runtime — all OPTIONAL, so the DEFAULT build (and `cargo tree`) never sees them.
+worker = ["dep:async-nats", "dep:futures", "dep:tokio", "fieldloop-store/live-db"]
+
+[dependencies]
+# The frozen canonical schema this engine binds (Rollout / OutcomeEvent / Feedback,
+# the id newtypes, the monotonic clock). The attribution output must be these shapes.
+fieldloop-types = { workspace = true }
+# The validated config the engine reads attribution windows and calibration knobs
+# from (per embodiment, per outcome kind). A path dependency: this is a sibling
+# workspace crate, not one of the externally-versioned pins.
+fieldloop-config = { path = "../fieldloop-config" }
+# A stable, content-addressed digest of the attribution inputs is hashed into each
+# row's `dedup_key`, so an identical re-run is idempotent while a changed window
+# yields a different key. `serde_json` gives a deterministic, ordered serialization
+# of the digest fields to hash.
+serde_json = { workspace = true }
+serde = { workspace = true }
+# Distributed-credit attribution groups the N feedback rows of one outcome's
+# contributing set under a shared id (`contributing_set_id`); minting that v7 group
+# id needs the uuid crate directly, since the join now creates the id rather than
+# only forwarding ids the schema crate already produced.
+uuid = { workspace = true }
+
+# ---- worker feature only (optional; not built by the default gate) ----------
+# The storage layer's live ClickHouse client (behind its `live-db` feature) the worker
+# runs the canonical reward join through. Optional so the default build never pulls reqwest
+# or the live DB drivers; the `worker` feature turns on `fieldloop-store/live-db`.
+fieldloop-store = { workspace = true, optional = true }
+# The NATS client the worker subscribes to landed events with. Optional + gated so it never
+# enters the default tree.
+async-nats = { version = "0.38", optional = true }
+# `StreamExt::next` to pull messages off the subscription stream in the worker run loop.
+futures = { version = "0.3", optional = true }
+# The async runtime the worker's run loop awaits on. The pure engine needs no runtime, so
+# Tokio is optional and only pulled in under `worker`.
+tokio = { workspace = true, optional = true }

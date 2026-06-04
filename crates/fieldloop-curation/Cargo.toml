@@ -1,0 +1,24 @@
+[package]
+name = "fieldloop-curation"
+description = "Fieldloop curation: turns JOINed Feedback into versioned, reproducible training datasets with full bidirectional lineage. Pure, in-memory slice/pin/export logic; heavy I/O (payload decode, lakeFS, lineage store) sits behind traits with in-memory impls, so the whole loop is testable without any real I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The frozen canonical schema curation reads: Rollout, Feedback, FeedbackTarget,
+# FeedbackValue, the id newtypes, PolicyVersion, PayloadRef. The dataset we compile
+# is made of these shapes.
+fieldloop-types = { workspace = true }
+# The JOIN engine's read-side latest-wins resolver (`winning_binding`). Reused here
+# so curation picks the authoritative Feedback per target with the exact same
+# manual-outranks-automated / newest-wins rule, instead of re-implementing it.
+fieldloop-join = { path = "../fieldloop-join" }
+# `SliceSpec` is a query operators write down; serde makes it (de)serializable from
+# the same TOML/JSON config surface the rest of the system uses.
+serde = { workspace = true }
+# A deterministic, field-ordered serialization of the pinned manifest, hashed into
+# the content hash so identical (spec + inputs) collide to the same commit id.
+serde_json = { workspace = true }

@@ -1,0 +1,56 @@
+[package]
+name = "fieldloop-agent"
+description = "Fieldloop on-robot sidecar agent: store-and-forward, resumable, Safety-first uploads of finished recorded files to the cloud, durable across disconnects and restarts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Default build needs NOTHING external: the agent's store-and-forward logic and the
+# batch-assembly module are pure Rust + serde_json, so the offline closed-loop gate
+# compiles the default features with no cloud SDK and no socket.
+default = []
+# Opt-in real S3 uploader (`src/s3.rs`) AND the real `/v1/ingest` HTTP POST the
+# deployable binary makes after a sync. Pulls in the AWS S3 SDK + its async runtime
+# and a blocking HTTP client, all OPTIONAL deps gated behind this feature, so the
+# DEFAULT build never sees them and never opens a socket. Production and the live e2e
+# path enable `s3` to PUT bytes to a real bucket and register rollouts with the gateway.
+s3 = ["dep:aws-sdk-s3", "dep:tokio", "dep:reqwest"]
+
+[dependencies]
+# The persisted upload manifest is a small JSON file in a state dir; serde +
+# serde_json give it a stable, human-inspectable on-disk form so a restart can
+# read back exactly which files are already done and where each resume should
+# continue. serde_json also renders the gateway request body the batch module builds.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The canonical Rollout shape the batch-assembly module serializes into the gateway's
+# request body. Not gated: assembling the body needs no network.
+fieldloop-types = { workspace = true }
+
+# ---- s3 feature only (optional; not built by the default gate) -------------
+# The official AWS S3 SDK, so the bytes the agent uploads travel the same client a
+# production cloud deployment uses (IAM, signing, retries) instead of a second S3 impl.
+# `rustls` avoids a system OpenSSL build dependency; `behavior-version-latest` opts the
+# SDK into its current defaults so construction needs no separate version pin; `rt-tokio`
+# installs the Tokio-backed async sleep the SDK's retry/timeout layer requires (without it
+# the client panics at first use asking for a `sleep_impl`).
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["rustls", "behavior-version-latest", "rt-tokio"] }
+# The async runtime the AWS SDK is async over; the uploader owns a small runtime so the
+# synchronous Uploader trait can drive each PUT to completion.
+tokio = { workspace = true, optional = true }
+# Blocking HTTP client for the deployable binary's `POST /v1/ingest` to the real cloud
+# gateway after a sync. The blocking client is chosen because the agent's sync loop is a
+# plain (non-async) loop, so a blocking POST needs no runtime plumbing in `main`. `rustls`
+# (not the default native-tls) avoids a system OpenSSL build dependency, matching the S3
+# uploader's `rustls` choice; `json` gives `RequestBuilder::json` so the request body is
+# serialized with the same serde the gateway decodes. `default-features = false` drops the
+# native-tls default so only the rustls stack is compiled.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "rustls-tls", "json"] }
+
+[dev-dependencies]
+# Tests use throwaway state/data dirs cleaned up on drop, so a test never leaks
+# files or depends on a pre-existing directory.
+tempfile = "3"

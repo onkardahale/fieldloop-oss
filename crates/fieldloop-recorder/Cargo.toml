@@ -1,0 +1,19 @@
+[package]
+name = "fieldloop-recorder"
+description = "Fieldloop recorder: persists robot byte streams to MCAP files on per-stream-class writer threads, off the control-loop hot path."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The chosen on-disk container is MCAP (the open robotics log format). We use the
+# Foxglove `mcap` crate to write valid, finalized files (with footer/summary)
+# rather than hand-rolling the container. Default features pull the lz4/zstd
+# compression backends so written chunks can be compressed.
+mcap = "0.24"
+
+[dev-dependencies]
+# Round-trip tests write into a throwaway directory that is cleaned up on drop.
+tempfile = "3"

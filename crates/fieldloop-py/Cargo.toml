@@ -1,0 +1,45 @@
+[package]
+name = "fieldloop-py"
+description = "Thin PyO3 binding over the fieldloop OSS core: exposes the on-robot capture hot path and the decision->outcome attribution engine to Python (Cosmos/LeRobot/openpi callers) without adding any business logic of its own."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# A Python extension module is a C dynamic library that the interpreter dlopen()s,
+# so the crate must build as a cdylib, not a normal rlib.
+name = "fieldloop"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The real capture core this binding wraps — all behavior lives here; the binding
+# only marshals Python values to/from these calls.
+fieldloop-capture = { path = "../fieldloop-capture" }
+# Schema newtypes (RobotIdentity, EpisodeId, PolicyVersion, ...) the core consumes.
+fieldloop-types = { path = "../fieldloop-types" }
+# The decision->outcome attribution engine the `attribute` function drives. Default
+# features only — the pure, deterministic engine, never the `worker` feature (which
+# would pull async-nats and a live DB client into this leaf binding).
+fieldloop-join = { path = "../fieldloop-join" }
+# Parses the embodiment/attribution-window TOML attribution runs against, so a Python
+# caller hands in a config string and the binding turns it into a real Config.
+fieldloop-config = { path = "../fieldloop-config" }
+# The training-slice compiler the `curate` function drives (confidence gate, latest-wins
+# authoritative binding, grain rollup) — pure, no I/O.
+fieldloop-curation = { path = "../fieldloop-curation" }
+# The detectors + selective-upload broker the `select_uploads` function drives — pure,
+# no I/O, default features only.
+fieldloop-trigger = { path = "../fieldloop-trigger" }
+# Only to parse the optional `contributing_set_id` UUID when reconstructing a Feedback
+# from its dict, so the attribute->curate round trip is lossless.
+uuid = { workspace = true }
+
+[dependencies.pyo3]
+version = "0.23"
+# extension-module: build against the stable Python ABI without linking libpython,
+#   so the produced .so loads into whichever CPython runs it.
+# abi3-py312: target the stable ABI (abi3) with a 3.12 floor, so one built wheel
+#   works across 3.12+ interpreters instead of being pinned to one patch release.
+features = ["extension-module", "abi3-py312"]

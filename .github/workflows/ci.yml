@@ -1,0 +1,41 @@
+# Continuous integration: format, lint, and tests on every push and PR, so the OSS subset
+# stays green and the repo carries a build badge. Mirrors the local developer checks.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: rust (fmt · clippy · test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The PyO3 extension crate is excluded: an extension-module cdylib does not link
+      # libpython, so a cargo test harness can't be built against it. The Python job below
+      # covers it via pytest.
+      - run: cargo test --workspace --exclude fieldloop-py
+
+  python:
+    name: python binding (ruff · pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The binding compiles a Rust extension via maturin, so the Python job needs the
+      # toolchain too.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v5
+      - run: uv run --project crates/fieldloop-py --extra dev ruff check crates/fieldloop-py
+      - run: uv run --project crates/fieldloop-py --extra dev pytest -q crates/fieldloop-py/tests

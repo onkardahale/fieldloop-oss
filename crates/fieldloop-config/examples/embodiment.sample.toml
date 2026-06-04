@@ -1,0 +1,39 @@
+# Copy-me sample: one embodiment plus the required calibration section.
+#
+# The embodiment table key is the stable robot-type name that the runtime looks up.
+[embodiments.warehouse_pick_arm]
+# The control interface your robot exposes. This drives action normalization.
+action_space = "joint_position"
+
+[embodiments.warehouse_pick_arm.attribution.collision]
+# How far after a rollout a collision may still bind back to it.
+window_ms = 150
+# Collision is a tight-timing event, so it must only bind when rollout and outcome
+# share a boot and can be compared on the monotonic clock.
+requires_monotonic_colocation = true
+
+[embodiments.warehouse_pick_arm.attribution.e_stop]
+# E-stop may lag slightly behind the triggering rollout because of control and I/O.
+window_ms = 500
+# Like collision, e-stop is safety-critical and should stay clock-safe.
+requires_monotonic_colocation = true
+
+[embodiments.warehouse_pick_arm.attribution.teleop_takeover]
+# Human takeover can trail the triggering behavior by a wider window.
+window_ms = 1500
+# This kind may bind on the wall-clock estimate when monotonic colocation is absent.
+requires_monotonic_colocation = false
+
+[embodiments.warehouse_pick_arm.attribution.downstream_failure]
+# Task-level failure may only become visible after several more steps.
+window_ms = 5000
+# Because the signal is looser and later, wall-clock matching is allowed here.
+requires_monotonic_colocation = false
+
+[calibration]
+# Version label for the confidence calibration that produced live scores.
+version = "warehouse-pick-arm-v1"
+# Fallback temporal window used when an embodiment does not override a kind.
+temporal_window_default_ms = 2000
+# Minimum heartbeat coverage needed before synthetic absence is trusted.
+heartbeat_coverage_k = 0.9

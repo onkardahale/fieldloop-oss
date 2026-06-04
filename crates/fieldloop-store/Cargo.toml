@@ -1,0 +1,52 @@
+[package]
+name = "fieldloop-store"
+description = "Fieldloop storage layer: ClickHouse + Postgres schema, idempotent Rust-struct migrations, row serialization, the canonical rollout->outcome join read, and a fail-closed tenant-injecting query builder. Pure SQL generation + serialization, unit-tested with no database; live DB clients are behind the optional `live-db` feature."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# Default build needs NOTHING external: it only GENERATES and VALIDATES SQL and
+# serializes rows. The closed-loop gate runs the default features, so it never
+# requires a running ClickHouse or Postgres.
+default = []
+# Opt-in live-DB layer. Compiles the thin async client wrappers in `src/live.rs`
+# AND pulls in the real drivers (reqwest for the ClickHouse HTTP interface,
+# tokio-postgres for the control plane). These are all OPTIONAL deps gated behind
+# this feature, so the DEFAULT build never sees them: the closed-loop gate runs the
+# default features offline and only ever GENERATES/VALIDATES SQL — it never fetches a
+# network crate or opens a socket. The live integration tests are `#[ignore]`d and
+# env-gated, so even `cargo test --features live-db` needs no database unless an
+# operator sets CLICKHOUSE_URL / DATABASE_URL and runs `-- --ignored`.
+live-db = ["dep:tokio", "dep:reqwest", "dep:tokio-postgres"]
+
+[dependencies]
+# Row JSON: every storage row is serialized to a ClickHouse JSONEachRow line.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The frozen canonical schema this storage layer persists (Rollout / OutcomeEvent /
+# Feedback and the id newtypes). The schema columns must match these shapes.
+fieldloop-types = { workspace = true }
+# Structured error for the fail-closed query builder (a missing tenant is an error,
+# never a silently-unscoped query).
+thiserror = { workspace = true }
+# UUID -> UInt128 re-key encoding for the id columns that sit in a ClickHouse sort
+# key (a UUIDv7 stored as `UUID` does not sort chronologically).
+uuid = { workspace = true }
+
+# ---- live-db only (optional; not built by the default gate) ----------------
+# Async runtime the live client wrappers are async over. Already vendored by the
+# workspace, so enabling `live-db` needs no network fetch and the build stays offline.
+tokio = { workspace = true, optional = true }
+# ClickHouse has no Rust-native protocol crate we want to depend on; its HTTP
+# interface takes a statement (DDL / `INSERT ... FORMAT JSONEachRow` / `SELECT`) as
+# the POST body, so a plain async HTTP client is all the ClickHouse side needs.
+# `rustls-tls` avoids a system OpenSSL build dependency; `json` is unused (we parse
+# response bodies ourselves) so it is left off to keep the surface small.
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["rustls-tls"] }
+# The Postgres control-plane driver. Used to run the registry/ledger/idempotency DDL,
+# do parameterized (never-interpolated) inserts, set the per-connection tenant GUC so
+# row-level security applies, and read back tenant-scoped rows.
+tokio-postgres = { version = "0.7", optional = true }

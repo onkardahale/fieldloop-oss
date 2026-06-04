@@ -1,0 +1,38 @@
+# Python packaging + uv project for the `fieldloop` binding.
+#
+# maturin is the build backend: it compiles the `fieldloop-py` Rust crate into a
+# CPython extension module and packages it as the importable `fieldloop` module.
+# uv drives this — `uv run pytest` builds the extension (via maturin) into the
+# project venv and runs the test suite against it.
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fieldloop"
+version = "0.1.0"
+description = "Thin Python binding over the Fieldloop Rust capture core — the non-blocking, in-control-loop on-robot capture SDK."
+requires-python = ">=3.12"
+# No runtime Python deps: all behavior is in the compiled Rust extension.
+dependencies = []
+
+[project.optional-dependencies]
+# Dev/test tooling, installed by uv into the project venv.
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.maturin]
+# Point maturin at this crate's manifest. Pure-Rust layout: the compiled crate IS
+# the importable `fieldloop` module (its [lib] name and #[pymodule] are both
+# `fieldloop`), so no separate Python source tree is needed.
+manifest-path = "Cargo.toml"
+module-name = "fieldloop"
+# extension-module: build the .so against the stable ABI without linking libpython,
+# so the wheel loads into the interpreter that runs it.
+features = ["pyo3/extension-module"]
+
+# uv project config: declare pytest/ruff as the dev dependency group so
+# `uv run --extra dev pytest` resolves and installs them alongside the built wheel.
+[tool.uv]
+# Rebuild the extension on every `uv run` so a Rust source edit is always reflected
+# in the test run (the binding is the closed loop for this part).
+reinstall-package = ["fieldloop"]
