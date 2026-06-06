@@ -6,24 +6,43 @@
   </picture>
 </p>
 
-**FieldLoop binds your robot's decisions to what happened next.**
+**An open incident workbench for robot field failures.**
 
-It captures the decisions a policy made, attributes delayed real-world outcomes back to
-the decision that caused them (with calibrated confidence), curates the trusted ones into
-a training/eval slice, and selects which raw sensor payloads are worth pulling — for one
-robotics team, on its own data, with no database to set up. (The loop is fully in-memory;
-persisting to ClickHouse/Postgres is an opt-in, not a prerequisite.)
+FieldLoop helps a robotics team work from the logs it already has: find the
+incident window, replay the right context, see whether the failure is recurring,
+and turn useful events into training or evaluation evidence.
 
-## Run the loop in one command
+It is built for the messy middle of robotics work:
 
-Requires Rust, [`uv`](https://docs.astral.sh/uv/), and Python 3.12+. Check your toolchain:
+```text
+robot runs
+  -> logs everything
+  -> something fails later
+  -> engineer finds the window
+  -> FieldLoop binds the outcome back to candidate decisions
+  -> useful incidents become replayable evidence and curated slices
+```
+
+FieldLoop does not replace ROS bags, MCAP, Foxglove, RViz, notebooks, or your
+training stack. Those tools tell you what happened. FieldLoop helps answer:
+
+- Which decision, planner command, mode transition, or policy action preceded
+  the outcome?
+- Is this failure recurring across runs, robots, sites, or versions?
+- Is the attribution strong enough to learn from?
+- What should be replayed, reviewed, exported, or held out?
+
+## Run the local loop
+
+Requires Rust, [`uv`](https://docs.astral.sh/uv/), and Python 3.12+. Check your
+toolchain:
 
 ```bash
 ./scripts/preflight.sh
 ```
 
-Then run the whole loop locally (the first run compiles a Rust Python extension from
-source — no PyPI install, no services):
+Then run the loop locally. The first run compiles a Rust Python extension from
+source; there is no PyPI install, database, cloud account, or fleet service:
 
 ```bash
 uv run --project crates/fieldloop-py --extra dev \
@@ -39,9 +58,13 @@ You should see:
 4. SELECT UPLOADS  selected 1 payload request (reflex_a, safety) · 2 budget drops
 ```
 
-No database to set up. No cloud account. No fleet. The core idea: FieldLoop does not claim
-root cause — it attributes delayed outcomes back to policy decisions *with confidence*,
-then **fails closed** when confidence is too low.
+The demo is intentionally small. It shows the core behavior on in-memory data:
+capture decisions, attach late outcomes, attribute them with confidence, hold weak
+evidence for review, and select the raw payloads worth pulling.
+
+FieldLoop does not claim automatic root cause. It builds an evidence package:
+ranked leads, replayable windows, attribution method, confidence, and a path for
+human confirmation.
 
 ## What to touch first
 
@@ -59,19 +82,58 @@ Most engineers only need these:
 
 Everything else in the workspace is internals — ignore it until you need it.
 
-## Current Status
+## What FieldLoop does
 
-Supported in this workspace:
+- Captures robot decision metadata without blocking the control loop.
+- Accepts outcomes such as teleop takeovers, e-stops, collisions, downstream
+  failures, task success, and heartbeat coverage.
+- Attributes delayed outcomes back to candidate decisions by method and
+  confidence.
+- Keeps confirmed evidence, inferred hypotheses, and excluded bindings distinct.
+- Extracts replayable incident windows instead of asking engineers to scrub huge
+  logs by hand.
+- Curates trusted `(decision, outcome)` pairs into training and evaluation slices.
+- Selects which raw sensor payloads are worth pulling for review.
 
-- Rust capture SDK and Python binding for decision metadata.
-- MCAP recorder for sensor, metadata, and safety streams.
-- Ingest router, row serialization, migrations, and tenant-scoped query helpers.
-- Outcome-to-rollout attribution engine.
-- Incident evidence, replay, curation, evaluation, and LeRobot-style export primitives.
+The point is not to record more data. The point is to decide which recorded events
+are useful evidence.
 
-Not presented as finished product surfaces here: hosted fleet operations, a
-fleet dashboard, enterprise workflow, production RBAC, durable audit storage, and
-rollout-control operations.
+## Why this matters
+
+A robot log can show:
+
+```text
+12.4s  grasp command sent
+14.1s  object slipped
+```
+
+That does not prove the grasp command caused the slip. The failure might belong to
+perception, planning, control, hardware, a later disturbance, or an ambiguous
+chain that should not train a policy at all.
+
+FieldLoop makes that uncertainty explicit. Every binding says how it was joined,
+how confident the system is, and whether a human confirmed it, should review it,
+or should exclude it.
+
+Weak evidence should not silently become training data.
+
+## Where it fits
+
+```text
+ROS / MCAP / custom logs
+        |
+        v
+FieldLoop local incident workbench
+        |
+        v
+replay bundles + recurring failure evidence + curated slices
+        |
+        v
+LeRobot / PyTorch / Isaac / custom training and eval
+```
+
+Start from historical logs and incident timestamps. Instrumentation improves the
+next run, but it is not a prerequisite for first value.
 
 ## Intended Users
 
@@ -88,9 +150,11 @@ It is meant to answer:
 - Can this become curated training or evaluation data?
 
 The current public surface is for one robotics team working locally with its own
-data.
+data. Hosted fleet operations, enterprise workflow, production RBAC, durable audit
+storage, fleet-wide reporting, and rollout-control operations are not presented as
+finished public surfaces here.
 
-## Implemented Components
+## Implemented components
 
 - Captures rollout decision metadata from the control-loop path.
 - Records MCAP streams for sensor, metadata, and safety channels.
@@ -102,7 +166,7 @@ data.
 - Defines robot-specific adapters for action normalization, success detection, and attribution windows.
 - Exports curated slices for training and evaluation workflows.
 
-## Supported Surface
+## Supported surface
 
 Supported integration points in this workspace:
 
@@ -237,6 +301,13 @@ See:
 
 - `crates/fieldloop-adapter/examples/onboard_your_robot.rs`
 - `crates/fieldloop-config/examples/embodiment.sample.toml`
+
+## Learn more
+
+- [`docs/quickstart.md`](docs/quickstart.md) — the attribution cascade on in-memory data.
+- [`docs/concepts.md`](docs/concepts.md) — the loop concepts and evidence states.
+- [`docs/onboard-your-robot.md`](docs/onboard-your-robot.md) — move from toy data to your robot.
+- [`docs/incident-workbench.md`](docs/incident-workbench.md) — the local incident workflow.
 
 ## License
 
