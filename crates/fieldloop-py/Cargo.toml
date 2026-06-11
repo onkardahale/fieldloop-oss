@@ -9,8 +9,11 @@ repository.workspace = true
 
 [lib]
 # A Python extension module is a C dynamic library that the interpreter dlopen()s,
-# so the crate must build as a cdylib, not a normal rlib.
-name = "fieldloop"
+# so the crate must build as a cdylib, not a normal rlib. Named `_native` because the
+# compiled module is an internal of the `fieldloop` Python package (mixed layout): the
+# package `__init__` re-exports it, and pure-Python tooling (the CLI, the demo) layers
+# on top without the Rust crate owning any of it.
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
@@ -23,6 +26,9 @@ fieldloop-types = { path = "../fieldloop-types" }
 # features only — the pure, deterministic engine, never the `worker` feature (which
 # would pull async-nats and a live DB client into this leaf binding).
 fieldloop-join = { path = "../fieldloop-join" }
+# The MCAP file-import core the `attribute_mcap` function drives: decodes a real MCAP +
+# a topic-mapping TOML into the typed rollouts/outcomes the engine consumes. Pure.
+fieldloop-import = { path = "../fieldloop-import" }
 # Parses the embodiment/attribution-window TOML attribution runs against, so a Python
 # caller hands in a config string and the binding turns it into a real Config.
 fieldloop-config = { path = "../fieldloop-config" }

@@ -1,16 +1,17 @@
-# Python packaging + uv project for the `fieldloop` binding.
+# Python packaging + uv project for the `fieldloop` package.
 #
-# maturin is the build backend: it compiles the `fieldloop-py` Rust crate into a
-# CPython extension module and packages it as the importable `fieldloop` module.
-# uv drives this — `uv run pytest` builds the extension (via maturin) into the
-# project venv and runs the test suite against it.
+# maturin is the build backend: it compiles the `fieldloop-py` Rust crate into the
+# internal `fieldloop._native` extension module and packages it alongside the
+# pure-Python tree under `python/` (the re-exporting `__init__`, the CLI, the demo) as
+# the importable `fieldloop` package. uv drives this — `uv run pytest` builds the
+# extension (via maturin) into the project venv and runs the test suite against it.
 [build-system]
 requires = ["maturin>=1,<2"]
 build-backend = "maturin"
 
 [project]
 name = "fieldloop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Thin Python binding over the Fieldloop Rust capture core — the non-blocking, in-control-loop on-robot capture SDK."
 requires-python = ">=3.12"
 # No runtime Python deps: all behavior is in the compiled Rust extension.
@@ -19,13 +20,30 @@ dependencies = []
 [project.optional-dependencies]
 # Dev/test tooling, installed by uv into the project venv.
 dev = ["pytest>=8", "ruff>=0.6"]
+# Visualization extra: `pip install "fieldloop[viz]"` adds Rerun so `fieldloop view`
+# can render attributed incidents on a timeline. Kept optional — the core loop and the
+# CLI's attribute/curate/doctor paths never need it.
+# >=0.23: RecordingStream.set_time(timeline, sequence=) was introduced in 0.23.
+viz = ["rerun-sdk>=0.23"]
+# LeRobot import extra: `pip install "fieldloop[lerobot]"` adds the LeRobot dataset
+# loader so `fieldloop import-lerobot` can turn a recorded dataset into rollouts +
+# outcomes. Heavy (pulls torch); kept optional and never needed by the core paths.
+lerobot = ["lerobot>=0.5"]
+
+# The console entry point: `fieldloop demo|attribute|curate|init` after any install of
+# the wheel. The callable returns an int exit code, which the script wrapper passes to
+# the shell, so CLI failures are scriptable.
+[project.scripts]
+fieldloop = "fieldloop._cli:main"
 
 [tool.maturin]
-# Point maturin at this crate's manifest. Pure-Rust layout: the compiled crate IS
-# the importable `fieldloop` module (its [lib] name and #[pymodule] are both
-# `fieldloop`), so no separate Python source tree is needed.
+# Mixed Rust/Python layout: the compiled crate is the internal `fieldloop._native`
+# module, and the pure-Python package under `python/` (re-exports, CLI, demo data)
+# wraps it. This keeps `import fieldloop` unchanged while letting the package carry
+# tooling that has no business living in Rust.
 manifest-path = "Cargo.toml"
-module-name = "fieldloop"
+module-name = "fieldloop._native"
+python-source = "python"
 # extension-module: build the .so against the stable ABI without linking libpython,
 # so the wheel loads into the interpreter that runs it.
 features = ["pyo3/extension-module"]

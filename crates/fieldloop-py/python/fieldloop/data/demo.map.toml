@@ -1,0 +1,33 @@
+# Bundled demo topic-mapping (synthetic). Maps the demo MCAP's topics to fieldloop
+# roles so `fieldloop attribute data/demo.mcap --map data/demo.map.toml
+# --config data/embodiment.sample.toml` binds the e-stop back to the decision it
+# followed. A generic MCAP carries no tenant/robot/episode/policy, so the mapping
+# supplies them once (single-boot v1: one file = one robot, one boot, one episode).
+tenant_id = "demo"
+robot_id = "demo-arm-01"
+boot_id = "00000000-0000-7000-8000-0000000000d0"
+episode_id = "00000000-0000-7000-8000-0000000000e0"
+# Must name an embodiment present in the --config; the demo uses the packaged sample's.
+embodiment = "warehouse_pick_arm"
+policy_version = "demo-policy-v1"
+task_id = "pick-place"
+
+[clock]
+# MCAP stamps each message with log_time and publish_time; v1 reads one as the
+# monotonic clock under the single-boot assumption.
+source = "log_time"
+
+[[decisions]]
+topic = "/policy/action"
+
+[[outcomes]]
+topic = "/safety/estop"
+outcome_kind = "e_stop"
+
+[[outcomes]]
+topic = "/teleop/takeover"
+outcome_kind = "teleop_takeover"
+
+[[outcomes]]
+topic = "/collision/event"
+outcome_kind = "collision"

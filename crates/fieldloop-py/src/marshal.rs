@@ -337,6 +337,18 @@ pub(crate) enum Routed {
     Heartbeat(fieldloop_join::Heartbeat),
 }
 
+/// Route one outcome to the failure cascade or the heartbeat coverage set — the single
+/// home of the heartbeat-vs-outcome policy, shared by the dict and file-import paths.
+pub(crate) fn route_outcome(outcome: OutcomeEvent) -> Routed {
+    if outcome.outcome_kind == OutcomeKind::Heartbeat {
+        return Routed::Heartbeat(fieldloop_join::Heartbeat {
+            robot: outcome.robot,
+            clock: outcome.clock,
+        });
+    }
+    Routed::Outcome(Box::new(outcome))
+}
+
 /// Marshal one outcome dict, routing a heartbeat kind to the coverage set.
 ///
 /// An optional `explicit_rollout_id` is the highest-certainty channel: when present the
@@ -346,11 +358,15 @@ pub(crate) enum Routed {
 pub(crate) fn dict_to_outcome(d: &Bound<'_, PyDict>) -> PyResult<Routed> {
     let (robot, clock) = read_robot_and_clock(d)?;
     let kind = parse_outcome_kind(&req_str(d, "outcome_kind")?)?;
+    // Heartbeat early-return: a heartbeat dict carries no explicit_rollout_id/outcome_id
+    // worth reading, so we route before parsing those optional fields.
     if kind == OutcomeKind::Heartbeat {
-        return Ok(Routed::Heartbeat(fieldloop_join::Heartbeat {
+        return Ok(route_outcome(OutcomeEvent::new(
             robot,
             clock,
-        }));
+            kind,
+            BoundedBlob::empty(),
+        )));
     }
     let mut outcome = OutcomeEvent::new(robot, clock, kind, BoundedBlob::empty());
     if let Some(explicit) = opt_str(d, "explicit_rollout_id")? {
@@ -359,7 +375,7 @@ pub(crate) fn dict_to_outcome(d: &Bound<'_, PyDict>) -> PyResult<Routed> {
     if let Some(id) = opt_str(d, "outcome_id")? {
         outcome.id = parse_id::<OutcomeId>(&id, "outcome_id")?;
     }
-    Ok(Routed::Outcome(Box::new(outcome)))
+    Ok(route_outcome(outcome))
 }
 
 /// Convert one [`Feedback`] binding into a flat dict. The `target` and `value` sum types

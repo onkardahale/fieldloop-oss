@@ -1,8 +1,7 @@
 # Onboard your robot
 
 You ran [`examples/loop.py`](../crates/fieldloop-py/examples/loop.py) on toy data. This
-walks you from that demo to *your* robot, one small change at a time. You do not need to
-read the internals or the ADRs to wire up a first real signal.
+walks you from that demo to your robot. You do not need to read the internals or the ADRs.
 
 The loop is four calls. Onboarding is: feed them your data instead of the toy data.
 
@@ -74,8 +73,9 @@ it as drained.
 ## Step C — Feed in your real outcomes
 
 An outcome is just a dict of what happened, when. The important part: **it does not need a
-rollout id.** That is the whole point — FieldLoop reconstructs which decision it belongs
-to from the clock and the embodiment's window.
+rollout id.** That is the whole point — a teleop takeover or e-stop arrives after the causing decision
+with no pointer back, and FieldLoop reconstructs which decision it belongs to from the
+clock and the attribution window.
 
 ```python
 outcomes = [
@@ -112,9 +112,11 @@ print("accepted:", len(curated["items"]), "needs_review:", len(curated["needs_re
 
 Two things to watch, because they are the point of the system:
 
-- **Confidence is calibrated, not asserted.** A binding far from its decision (near the
+- **Confidence is scored, not asserted.** A binding far from its decision (near the
   window edge) comes back with low confidence. Move an outcome's `mono_ns` closer to a
-  decision and watch the confidence rise.
+  decision and watch the confidence rise. The default score is the raw recency/coverage
+  signal; a calibration curve fit from your team's confirmed labels replaces it once
+  enough ground truth exists.
 - **Curation fails closed.** Raise or lower `min_confidence` and watch bindings move
   between the training slice (`items`) and `needs_review`. A label you are not confident in
   never silently enters training data.

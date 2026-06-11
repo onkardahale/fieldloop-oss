@@ -194,19 +194,32 @@ mod tests {
         assert_eq!(rollout, back);
     }
 
-    /// The safety-eligibility helper guards on confidence and retraction, the
-    /// confidence half of the safety gate.
+    /// The safety-eligibility helper guards on the join METHOD, full confidence, and
+    /// retraction: only a KNOWN binding (Explicit/Manual) at full confidence and not
+    /// retracted is eligible. The method clause enforces anti-circularity; the
+    /// confidence clause is the integrity defense.
     #[test]
-    fn safety_eligibility_requires_full_confidence_and_not_retracted() {
-        let mut fb = sample_feedback();
-        fb.join_confidence = 1.0;
-        assert!(fb.is_safety_eligible_confidence());
+    fn safety_eligibility_requires_known_method_full_confidence_and_not_retracted() {
+        // An inferred temporal binding is never eligible, even forced to full confidence
+        // (this is the anti-circularity rule the method clause enforces).
+        let mut inferred = sample_feedback(); // JoinMethod::Temporal
+        inferred.join_confidence = 1.0;
+        assert!(!inferred.is_safety_eligible_confidence());
 
-        fb.retracted = true;
-        assert!(!fb.is_safety_eligible_confidence());
+        // A known (explicit) binding at full confidence is eligible.
+        let mut known = sample_feedback();
+        known.join_method = JoinMethod::Explicit;
+        known.join_confidence = 1.0;
+        assert!(known.is_safety_eligible_confidence());
 
-        fb.retracted = false;
-        fb.join_confidence = 0.999;
-        assert!(!fb.is_safety_eligible_confidence());
+        // A known binding that somehow arrived below full confidence is corrupt and is
+        // excluded by the integrity defense (a real Explicit/Manual row is always 1.0).
+        known.join_confidence = 0.99;
+        assert!(!known.is_safety_eligible_confidence());
+
+        // ...and a retracted known binding is never eligible.
+        known.join_confidence = 1.0;
+        known.retracted = true;
+        assert!(!known.is_safety_eligible_confidence());
     }
 }

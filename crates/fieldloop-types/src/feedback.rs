@@ -258,26 +258,34 @@ fn default_credit_weight() -> f32 {
 }
 
 impl Feedback {
-    /// True iff this row clears the *confidence* bar for the safety-regression eval
-    /// path: not retracted, `join_confidence == 1.0`, AND it is the single
-    /// unambiguous in-window binding (`credit_weight == 1.0` and no contributing-set
-    /// group). Safety must rest only on bindings that are certain, never guessed, and
-    /// never on one share of a credit that was split across several candidate
-    /// rollouts — when the cause is genuinely ambiguous between co-contributors, no
-    /// single share is a certain enough anchor for a physical-safety veto, so a
-    /// distributed-credit row is excluded here even if its calibrated confidence
-    /// reads 1.0.
+    /// True iff this row clears the *certainty* bar for the safety-regression eval
+    /// path: not retracted, bound by a method that is certain by construction —
+    /// `Explicit` (the outcome carried the exact rollout id) or `Manual` (a human
+    /// asserted the binding) — AND at full confidence.
     ///
-    /// This is only the confidence half of the gate. The full gate also requires the
+    /// The METHOD clause is what enforces anti-circularity: safety may rest only on
+    /// KNOWN bindings, never inferred ones. A temporal/spatial/causal/synthetic-absence
+    /// binding is a probabilistic guess and must never be safety-eligible even when its
+    /// score happens to read 1.0 — a lone temporal candidate at zero delay scores a raw
+    /// 1.0 under the identity calibrator, and the previous gate (which checked only
+    /// `confidence == 1.0`, with no method clause) silently admitted exactly that. The
+    /// `confidence == 1.0` clause is kept as a defense-in-depth integrity check, NOT as
+    /// the certainty test: every calibrator forces Explicit/Manual to exactly 1.0 by
+    /// construction, so for an eligible method the comparison is provably exact and never
+    /// fragile — but a known binding that somehow arrived below full confidence is
+    /// corrupt and must not feed a physical-safety veto. Explicit/Manual are single,
+    /// full-credit bindings by construction, so this also subsumes the old
+    /// "single unambiguous binding" requirement.
+    ///
+    /// This is only the certainty half of the gate. The full gate also requires the
     /// underlying rollout to be ledger-`trusted` — a property of the
     /// [`crate::Rollout`], not visible on this row — so callers MUST also check
     /// `Rollout.trust == Trusted`. Kept here as a guarded helper, not enforced.
     #[must_use]
     pub fn is_safety_eligible_confidence(&self) -> bool {
         !self.retracted
+            && matches!(self.join_method, JoinMethod::Explicit | JoinMethod::Manual)
             && self.join_confidence == 1.0
-            && self.credit_weight == 1.0
-            && self.contributing_set_id.is_none()
     }
 }
 
@@ -316,24 +324,37 @@ mod tests {
         assert!(full_credit_row().is_safety_eligible_confidence());
     }
 
-    /// A distributed-credit share is NEVER safety-eligible even at full calibrated
-    /// confidence: a partial `credit_weight` means the cause was split across several
-    /// candidates, so no one share is a certain anchor for a physical-safety veto.
+    /// A distributed-credit share is NEVER safety-eligible: the engine only distributes
+    /// credit across candidates of an INFERRED method (temporal/causal), and an inferred
+    /// binding is a guess — never a certain anchor for a physical-safety veto.
     #[test]
     fn distributed_credit_share_is_not_safety_eligible() {
         let mut f = full_credit_row();
+        f.join_method = JoinMethod::Temporal;
         f.credit_weight = 0.6;
         f.contributing_set_id = Some(Uuid::now_v7());
         assert!(!f.is_safety_eligible_confidence());
     }
 
-    /// Belonging to a contributing set disqualifies a row from safety even if its
-    /// own weight happened to round to 1.0 — group membership alone marks ambiguity.
+    /// A lone temporal binding at confidence 1.0 (a coincident outcome under the
+    /// identity calibrator) is STILL not safety-eligible — gating on the method, not a
+    /// float, is exactly what enforces the anti-circularity rule that inferred evidence
+    /// can never be a safety anchor.
     #[test]
-    fn grouped_row_is_not_safety_eligible() {
-        let mut f = full_credit_row();
-        f.contributing_set_id = Some(Uuid::now_v7());
+    fn lone_temporal_full_confidence_row_is_not_safety_eligible() {
+        let mut f = full_credit_row(); // single, full-credit, ungrouped
+        f.join_method = JoinMethod::Temporal;
+        f.join_confidence = 1.0;
         assert!(!f.is_safety_eligible_confidence());
+    }
+
+    /// A human (Manual) binding is certain by construction and so safety-eligible, the
+    /// same as Explicit.
+    #[test]
+    fn manual_row_is_safety_eligible() {
+        let mut f = full_credit_row();
+        f.join_method = JoinMethod::Manual;
+        assert!(f.is_safety_eligible_confidence());
     }
 
     /// A row whose JSON predates the credit columns deserializes with full credit and

@@ -11,9 +11,6 @@
 //! human label — never fabricated by the join. The join's only job is the binding
 //! and the confidence.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use fieldloop_config::Config;
 use fieldloop_types::{
     Feedback, FeedbackId, FeedbackTarget, FeedbackValue, JoinMethod, LabelKind, MonoClock,
@@ -529,8 +526,12 @@ fn temporal_attribute(
         // scope — so a cross-boot rollout is never a distributed-credit contributor.
         match rollout.clock.mono_delta_ns(&outcome.clock) {
             Some(delta) => {
-                // Forward in time (outcome at or after rollout) and within the window.
-                if delta >= 0 && delta <= window_ns {
+                // Forward in time (outcome at or after rollout) and strictly inside the
+                // window. The edge is EXCLUSIVE (`< window_ns`): an outcome exactly at
+                // the window edge scores `temporal_raw_score == 0.0`, so admitting it
+                // would emit a confidence-0.0 binding nobody decided on. Excluding it
+                // makes an at-edge outcome an auditable `NoCandidateInWindow` instead.
+                if delta >= 0 && delta < window_ns {
                     candidates.push(TemporalCandidate {
                         idx,
                         rollout,
@@ -632,7 +633,10 @@ fn distribute_credit(
         })
         .collect();
 
-    let sum_raw: f64 = raws.iter().sum();
+    // Normalized credit shares that sum to EXACTLY 1.0 in f32 (the last share absorbs
+    // the rounding residual — see `conserved_credit_weights`), so the distributed credit
+    // conserves the outcome's confidence rather than drifting by a few ULPs.
+    let weights = conserved_credit_weights(&raws);
 
     // The contributing-set id groups the rows of a MULTI-contributor split. A lone
     // candidate is the single unambiguous binding and carries no group id (so it stays
@@ -645,16 +649,8 @@ fn distribute_credit(
 
     candidates
         .iter()
-        .zip(raws.iter())
-        .map(|(c, &raw)| {
-            // Normalize to a share in (0, 1]. If every raw underflowed to 0 (only
-            // possible with a degenerate window and no coincident rollout), fall back
-            // to an equal split so credit is conserved rather than silently dropped.
-            let credit_weight = if sum_raw > 0.0 {
-                (raw / sum_raw) as f32
-            } else {
-                (1.0 / candidates.len() as f64) as f32
-            };
+        .zip(weights.iter())
+        .map(|(c, &credit_weight)| {
             let delay_ms = Some((c.delta / 1_000_000) as i64);
             let feedback = build_feedback(
                 outcome,
@@ -682,6 +678,41 @@ fn distribute_credit(
 /// whole point of distributing rather than dropping co-candidates. Kept as a named
 /// constant so the credit curve is one documented knob rather than a buried literal.
 const TAU_WINDOW_FRACTION: f64 = 3.0;
+
+/// Normalize raw decay weights into f32 credit shares that sum to EXACTLY 1.0.
+///
+/// Each share is `raw_i / Σraw`, but independently rounding every f64 ratio to f32
+/// leaves `Σ shares ≠ 1.0` by a few ULPs — which breaks the credit-conservation law the
+/// distributed-credit rows must satisfy (one outcome's confidence is partitioned, never
+/// created or lost). Computing the final share as `1.0 − Σ(prior shares)` in f32, using
+/// the SAME left-to-right accumulation a later `.sum()` performs, forces the residual
+/// into the last share so the stored weights add back to exactly 1.0. An all-zero `Σraw`
+/// (degenerate window, no coincident rollout) falls back to an equal split, still made
+/// exact by the same remainder rule. A single candidate gets exactly `1.0`.
+fn conserved_credit_weights(raws: &[f64]) -> Vec<f32> {
+    let n = raws.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let sum_raw: f64 = raws.iter().sum();
+    let mut weights = Vec::with_capacity(n);
+    let mut acc = 0.0f32;
+    for (i, &raw) in raws.iter().enumerate() {
+        if i + 1 == n {
+            // The last share is the remainder, so Σ weights == 1.0 exactly.
+            weights.push(1.0 - acc);
+        } else {
+            let w = if sum_raw > 0.0 {
+                (raw / sum_raw) as f32
+            } else {
+                (1.0 / n as f64) as f32
+            };
+            acc += w;
+            weights.push(w);
+        }
+    }
+    weights
+}
 
 /// An event's time on the COMMON SERVER-ANCHORED timeline, in nanoseconds, or `None`
 /// if the event carries no [`fieldloop_types::ServerAnchor`].
@@ -768,10 +799,20 @@ fn spatial_attribute(
         if (out_anchored - roll_anchored).abs() > time_bound_ns {
             continue;
         }
-        // Keep the spatially nearest candidate.
-        match best {
-            Some((_, _, best_dist)) if dist >= best_dist => {}
-            _ => best = Some((idx, rollout, dist)),
+        // Keep the spatially nearest candidate, breaking an exact-distance tie by the
+        // lower rollout id. Without the tie-break the winner depended on input slice
+        // order (`dist >= best_dist` kept whichever was seen first), which made the
+        // bound rollout — and therefore the dedup key — non-deterministic under
+        // reordering. The id is a stable, total order (and, being UUIDv7, also the
+        // earlier-minted rollout), so the same candidate set always binds the same row.
+        let replace = match best {
+            None => true,
+            Some((_, best_rollout, best_dist)) => {
+                dist < best_dist || (dist == best_dist && rollout.id < best_rollout.id)
+            }
+        };
+        if replace {
+            best = Some((idx, rollout, dist));
         }
     }
 
@@ -940,7 +981,9 @@ fn causal_attribute(
         .iter()
         .map(|(_, _, back)| (-(*back as f64) / tau).exp())
         .collect();
-    let sum_raw: f64 = raws.iter().sum();
+    // Shares summing to exactly 1.0 in f32 (last share absorbs the rounding residual),
+    // the same conservation the temporal tier uses.
+    let weights = conserved_credit_weights(&raws);
 
     let set_id = if candidates.len() > 1 {
         Some(Uuid::now_v7())
@@ -950,13 +993,8 @@ fn causal_attribute(
 
     let bindings = candidates
         .iter()
-        .zip(raws.iter())
-        .map(|((idx, rollout, back), &raw_w)| {
-            let credit_weight = if sum_raw > 0.0 {
-                (raw_w / sum_raw) as f32
-            } else {
-                (1.0 / candidates.len() as f64) as f32
-            };
+        .zip(weights.iter())
+        .map(|((idx, rollout, back), &credit_weight)| {
             let delay_ms = Some((*back / 1_000_000) as i64);
             let feedback = build_feedback(
                 outcome,
@@ -1256,20 +1294,26 @@ fn bound_dedup_key(
     method: JoinMethod,
     opts: &AttributeOptions,
 ) -> String {
-    // The attribution-input digest: the inputs that, if changed, mean a genuinely
-    // different attribution decision. Serialized deterministically (a fixed field
-    // order in a tuple) and hashed, so the digest is reproducible across runs.
-    let mut hasher = DefaultHasher::new();
-    outcome.id.as_uuid().hash(&mut hasher);
-    rollout.id.as_uuid().hash(&mut hasher);
-    rollout.clock.boot_id.as_uuid().hash(&mut hasher);
-    rollout.clock.mono_ns.hash(&mut hasher);
-    outcome.clock.mono_ns.hash(&mut hasher);
-    opts.join_version.hash(&mut hasher);
-    let digest = hasher.finish();
+    // The attribution-input digest over the inputs that, if changed, mean a genuinely
+    // different attribution decision. Hashed with a PINNED algorithm (not std's
+    // `DefaultHasher`, whose digest is not stable across Rust releases) because this key
+    // is a persisted cross-run idempotency contract: a replay after a toolchain upgrade
+    // must reproduce the same key or it mints duplicate rows. The bytes are laid out in
+    // a fixed order with fixed widths, so the digest is reproducible forever.
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(outcome.id.as_uuid().as_bytes());
+    buf.extend_from_slice(rollout.id.as_uuid().as_bytes());
+    buf.extend_from_slice(rollout.clock.boot_id.as_uuid().as_bytes());
+    buf.extend_from_slice(&rollout.clock.mono_ns.to_le_bytes());
+    buf.extend_from_slice(&outcome.clock.mono_ns.to_le_bytes());
+    buf.extend_from_slice(opts.join_version.as_bytes());
+    let digest = fnv1a_64(&buf);
 
+    // `dk2:` is the digest-scheme tag. The prior scheme (std DefaultHasher) wrote keys
+    // without it, so old and new keys can never collide — a one-time, explicit cutover
+    // (there is no production data yet, which is why this lands before any exists).
     format!(
-        "out:{}|tgt:rollout:{}|method:{}|jv:{}|digest:{:016x}",
+        "dk2:out:{}|tgt:rollout:{}|method:{}|jv:{}|digest:{:016x}",
         outcome.id,
         rollout.id,
         method_tag(method),
@@ -1278,21 +1322,44 @@ fn bound_dedup_key(
     )
 }
 
+/// A pinned FNV-1a 64-bit hash of `bytes`, used for the dedup-key digest.
+///
+/// Pinned (the constants below are the published FNV-1a 64-bit offset basis and prime)
+/// rather than `std::hash::DefaultHasher`, whose algorithm std explicitly does not
+/// guarantee across Rust releases. The dedup key is a persisted idempotency contract,
+/// so its digest must be stable for the life of the data regardless of compiler
+/// version. 64 bits matches the prior key width; collision resistance is not required
+/// here because the key is already scoped by outcome id, target, method, and join
+/// version — the digest only has to distinguish a changed window/timing within that
+/// scope, which it does deterministically.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
 /// The dedup key for a synthesized absence row. There is no source outcome, so the
 /// key keys on the target rollout, the join version, and the coverage bound used
 /// (`max_gap`) — a changed coverage bound is a different absence decision and so
 /// yields a different key.
 fn absence_dedup_key(rollout: &Rollout, opts: &AttributeOptions, max_gap: i128) -> String {
-    let mut hasher = DefaultHasher::new();
-    rollout.id.as_uuid().hash(&mut hasher);
-    rollout.clock.boot_id.as_uuid().hash(&mut hasher);
-    rollout.clock.mono_ns.hash(&mut hasher);
-    opts.join_version.hash(&mut hasher);
-    max_gap.hash(&mut hasher);
-    let digest = hasher.finish();
+    // Same pinned-digest reasoning as `bound_dedup_key`: a stable algorithm over a
+    // fixed byte layout, so a synthesized-absence key survives a toolchain upgrade.
+    let mut buf = Vec::with_capacity(48);
+    buf.extend_from_slice(rollout.id.as_uuid().as_bytes());
+    buf.extend_from_slice(rollout.clock.boot_id.as_uuid().as_bytes());
+    buf.extend_from_slice(&rollout.clock.mono_ns.to_le_bytes());
+    buf.extend_from_slice(opts.join_version.as_bytes());
+    buf.extend_from_slice(&max_gap.to_le_bytes());
+    let digest = fnv1a_64(&buf);
 
     format!(
-        "absence|tgt:rollout:{}|jv:{}|digest:{:016x}",
+        "dk2:absence|tgt:rollout:{}|jv:{}|digest:{:016x}",
         rollout.id, opts.join_version, digest
     )
 }
@@ -1328,4 +1395,49 @@ pub fn winning_binding<'a>(_tenant: &TenantId, candidates: &'a [Feedback]) -> Op
             // Then by recency (the fresh v7 id is a coarse wall-time sort).
             .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{conserved_credit_weights, fnv1a_64};
+
+    /// `fnv1a_64` must be the canonical FNV-1a 64-bit function, not merely "some stable
+    /// hash" — pinned against the published reference vectors. This is what guarantees
+    /// the dedup-key digest is reproducible across Rust toolchains: the algorithm is a
+    /// fixed public standard, so the same bytes yield the same digest forever.
+    #[test]
+    fn fnv1a_64_matches_reference_vectors() {
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    /// Credit shares must sum to EXACTLY 1.0 in f32 across candidate counts and value
+    /// distributions — the conservation law the distributed-credit rows rest on. The
+    /// last-share-as-remainder construction makes the sum exact rather than off by a few
+    /// ULPs, which independent rounding of each ratio would otherwise leave.
+    #[test]
+    fn conserved_credit_weights_sum_to_exactly_one() {
+        let cases: &[&[f64]] = &[
+            &[1.0],
+            &[1.0, 1.0],
+            &[0.9, 0.6, 0.3, 0.05],
+            &[1.0, 0.367_879, 0.049_787], // exp(0), exp(-1), exp(-3): a real decay set
+            &[0.0, 0.0, 0.0],             // degenerate: equal split, still exact
+            &[7.0, 0.000_001],            // wildly unequal
+        ];
+        for raws in cases {
+            let weights = conserved_credit_weights(raws);
+            assert_eq!(weights.len(), raws.len());
+            let sum: f32 = weights.iter().sum();
+            assert_eq!(
+                sum, 1.0_f32,
+                "weights for {raws:?} summed to {sum}, not 1.0"
+            );
+        }
+        // A single candidate gets exactly full credit.
+        assert_eq!(conserved_credit_weights(&[0.42]), vec![1.0_f32]);
+        // Empty in, empty out (no candidates, no rows).
+        assert!(conserved_credit_weights(&[]).is_empty());
+    }
 }

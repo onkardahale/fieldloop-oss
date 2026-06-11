@@ -169,11 +169,12 @@ fn distributed_credit_splits_across_both_in_window_candidates() {
         older_row.credit_weight
     );
 
-    // The weights are a normalized split: they sum to ~1.0.
+    // The weights are a normalized split: they sum to EXACTLY 1.0 (the last share is
+    // assigned as the remainder, so f32 rounding cannot leak credit out of the sum).
     let sum = newer_row.credit_weight + older_row.credit_weight;
     assert!(
-        (sum - 1.0).abs() < 1e-5,
-        "credit weights must sum to 1.0, got {sum}"
+        sum == 1.0,
+        "credit weights must sum to exactly 1.0, got {sum}"
     );
 
     // Both rows share ONE contributing-set id, marking them as co-contributors.
@@ -257,8 +258,9 @@ fn distributed_confidence_is_conserved_across_contributors() {
 /// Back-compat: a SINGLE in-window rollout still produces exactly one row with full
 /// credit (`credit_weight == 1.0`), no contributing-set id, and the same calibrated
 /// confidence single-nearest attribution produced — so the multi-step generalization
-/// reduces exactly to the prior behavior when there is no ambiguity. A single
-/// full-credit binding remains safety-eligible at full confidence.
+/// reduces exactly to the prior behavior when there is no ambiguity. (Being a temporal,
+/// i.e. inferred, binding it is not safety-eligible — that is gated on the method now,
+/// not on the credit weight.)
 #[test]
 fn single_in_window_rollout_is_full_credit_and_back_compatible() {
     let r = robot("acme", "r1");
@@ -760,5 +762,216 @@ fn causal_refuses_upstream_outside_lag_window() {
     assert_eq!(
         report.skipped[0].reason,
         SkipReason::NoSpatialOrCausalCandidate
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Determinism, window-edge, and safety-gate semantics (work order: JOIN
+// determinism + stable dedup hash + safety gate). Each test below pins a
+// boundary the cascade's correctness lives on.
+// ----------------------------------------------------------------------------
+
+/// SPATIAL determinism: two co-located rollouts at the EXACTLY equal distance from the
+/// outcome must bind the same one regardless of input slice order — the lower rollout
+/// id wins. Without the tie-break the winner (and thus the dedup key) depended on
+/// argument order, making attribution non-reproducible.
+#[test]
+fn spatial_tie_breaks_deterministically_by_rollout_id() {
+    let r = robot("acme", "r1");
+    let roll_boot = BootId::new();
+    let out_boot = BootId::new();
+
+    // Outcome at the origin; each rollout 0.1m away on a different axis, so the two
+    // distances are computed from the identical f64 literal and are bit-for-bit equal.
+    let a = rollout_anchored(
+        &r,
+        roll_boot,
+        1_000 * MS,
+        9_000 * MS as i64,
+        Se3Pose::at(0.1, 0.0, 0.0),
+    );
+    let b = rollout_anchored(
+        &r,
+        roll_boot,
+        1_000 * MS,
+        9_000 * MS as i64,
+        Se3Pose::at(0.0, 0.1, 0.0),
+    );
+    let outcome = outcome_anchored(
+        &r,
+        out_boot,
+        2_000 * MS,
+        8_000 * MS as i64,
+        OutcomeKind::DownstreamFailure,
+        Se3Pose::at(0.0, 0.0, 0.0),
+    );
+    let expected = a.id.min(b.id);
+
+    for order in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+        let report = attribute_report(
+            &config(),
+            &order,
+            std::slice::from_ref(&outcome),
+            &[],
+            &opts(),
+        );
+        assert_eq!(
+            report.feedbacks.len(),
+            1,
+            "the tie must still produce one binding"
+        );
+        assert_eq!(report.feedbacks[0].join_method, JoinMethod::Spatial);
+        assert_eq!(
+            report.feedbacks[0].target.target_uuid(),
+            expected.as_uuid(),
+            "an exact spatial tie must bind the lower rollout id regardless of input order"
+        );
+    }
+}
+
+/// ANTI-CIRCULARITY: a coincident (delta-0) temporal binding scores a raw 1.0 under the
+/// identity calibrator, but it is still INFERRED, so it must never be safety-eligible.
+/// Gating on the method rather than the float is exactly what enforces this.
+#[test]
+fn coincident_temporal_binding_is_not_safety_eligible() {
+    let r = robot("acme", "r1");
+    let boot = BootId::new();
+    let rollout = rollout_at(&r, boot, 1_000 * MS);
+    let outcome = outcome_at(&r, boot, 1_000 * MS, OutcomeKind::TeleopTakeover); // delta 0
+
+    let fbs = attribute(
+        &config(),
+        std::slice::from_ref(&rollout),
+        &[outcome],
+        &[],
+        &opts(),
+    );
+    assert_eq!(fbs.len(), 1);
+    assert_eq!(fbs[0].join_method, JoinMethod::Temporal);
+    assert_eq!(
+        fbs[0].join_confidence, 1.0,
+        "a coincident temporal binding scores raw 1.0 under identity calibration"
+    );
+    assert!(
+        !fbs[0].is_safety_eligible_confidence(),
+        "an inferred temporal binding is never safety-eligible, even at confidence 1.0"
+    );
+}
+
+/// WINDOW EDGE is exclusive: an outcome exactly `window` after the rollout sits ON the
+/// edge, where the recency score is 0.0. Admitting it would emit a confidence-0.0
+/// binding nobody decided on; instead it is an auditable `NoCandidateInWindow`.
+#[test]
+fn outcome_exactly_at_window_edge_does_not_bind() {
+    let r = robot("acme", "r1");
+    let boot = BootId::new();
+    let rollout = rollout_at(&r, boot, 1_000 * MS);
+    // The takeover window is 5s; an outcome exactly 5s later is on the exclusive edge.
+    let outcome = outcome_at(&r, boot, 6_000 * MS, OutcomeKind::TeleopTakeover);
+
+    let report = attribute_report(
+        &config(),
+        std::slice::from_ref(&rollout),
+        &[outcome],
+        &[],
+        &opts(),
+    );
+    assert!(
+        report.feedbacks.is_empty(),
+        "an at-edge outcome must not bind"
+    );
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].reason, SkipReason::NoCandidateInWindow);
+}
+
+/// An outcome BEFORE every rollout has a negative forward delay and so is no temporal
+/// candidate at all — it must skip, not bind to a later rollout.
+#[test]
+fn outcome_before_all_rollouts_does_not_bind() {
+    let r = robot("acme", "r1");
+    let boot = BootId::new();
+    let rollout = rollout_at(&r, boot, 2_000 * MS);
+    let outcome = outcome_at(&r, boot, 1_000 * MS, OutcomeKind::TeleopTakeover); // earlier
+
+    let report = attribute_report(
+        &config(),
+        std::slice::from_ref(&rollout),
+        &[outcome],
+        &[],
+        &opts(),
+    );
+    assert!(report.feedbacks.is_empty());
+    assert_eq!(report.skipped[0].reason, SkipReason::NoCandidateInWindow);
+}
+
+/// An explicit rollout id that is NOT in the batch falls through to the temporal tier
+/// rather than failing — the explicit hint is an optimization, not a requirement.
+#[test]
+fn explicit_id_absent_from_batch_falls_through_to_temporal() {
+    let r = robot("acme", "r1");
+    let boot = BootId::new();
+    let rollout = rollout_at(&r, boot, 1_000 * MS);
+    let mut outcome = outcome_at(&r, boot, 1_500 * MS, OutcomeKind::TeleopTakeover);
+    outcome.explicit_rollout_id = Some(fieldloop_types::RolloutId::new()); // not present
+
+    let fbs = attribute(
+        &config(),
+        std::slice::from_ref(&rollout),
+        &[outcome],
+        &[],
+        &opts(),
+    );
+    assert_eq!(fbs.len(), 1);
+    assert_eq!(
+        fbs[0].join_method,
+        JoinMethod::Temporal,
+        "an explicit id absent from the batch must fall through to temporal"
+    );
+    assert_eq!(fbs[0].target.target_uuid(), rollout.id.as_uuid());
+}
+
+/// Distributed credit weights sum to EXACTLY 1.0 (not merely within a tolerance): the
+/// last share is the remainder, so f32 rounding cannot leak credit out of the sum.
+#[test]
+fn distributed_credit_weights_sum_to_exactly_one() {
+    let r = robot("acme", "r1");
+    let boot = BootId::new();
+    let a = rollout_at(&r, boot, 1_000 * MS);
+    let b = rollout_at(&r, boot, 1_400 * MS);
+    let c = rollout_at(&r, boot, 1_900 * MS);
+    let outcome = outcome_at(&r, boot, 2_000 * MS, OutcomeKind::TeleopTakeover);
+
+    let fbs = attribute(&config(), &[a, b, c], &[outcome], &[], &opts());
+    assert_eq!(fbs.len(), 3);
+    let sum: f32 = fbs.iter().map(|f| f.credit_weight).sum();
+    assert_eq!(
+        sum, 1.0_f32,
+        "distributed credit weights must sum to exactly 1.0, got {sum}"
+    );
+}
+
+/// The dedup key carries the pinned `dk2:` scheme tag, so a key written by the stable
+/// FNV-1a digest can never collide with a legacy (std-hash) key — the cutover is
+/// explicit in the key itself.
+#[test]
+fn dedup_key_carries_dk2_scheme_tag() {
+    let r = robot("acme", "r1");
+    let boot = BootId::new();
+    let rollout = rollout_at(&r, boot, 1_000 * MS);
+    let mut outcome = outcome_at(&r, boot, 1_500 * MS, OutcomeKind::DownstreamFailure);
+    outcome.explicit_rollout_id = Some(rollout.id);
+
+    let fbs = attribute(
+        &config(),
+        std::slice::from_ref(&rollout),
+        &[outcome],
+        &[],
+        &opts(),
+    );
+    assert_eq!(fbs.len(), 1);
+    assert!(
+        fbs[0].dedup_key.starts_with("dk2:"),
+        "dedup key must carry the dk2 scheme tag, got {}",
+        fbs[0].dedup_key
     );
 }

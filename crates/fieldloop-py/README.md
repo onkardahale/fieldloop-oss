@@ -1,30 +1,56 @@
-# fieldloop-py — Python binding over the Rust capture core
+# fieldloop-py — the `fieldloop` Python package
 
-This crate is **Part 3b**: a thin [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs)
-binding that exposes the `fieldloop-capture` hot path to Python. It is the entry
-point a robotics engineer (Cosmos / LeRobot / openpi) actually calls. It contains no
-business logic of its own — it only marshals Python values to and from the Rust core,
-which owns every behavioral guarantee (non-blocking minting, drop-and-count on a full
-queue, off-loop draining).
+The Python entry point a robotics engineer (Cosmos / LeRobot / openpi) actually uses:
+the on-robot capture hot path, the decision→outcome attribution engine, curation, and
+selective upload, plus a `fieldloop` command-line front door. The behavior lives in the
+Rust crates; this package only marshals values across the boundary and layers the CLI
+and demo on top.
 
 ## Layout
 
+Mixed [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs) package: a compiled
+Rust core wrapped by a small pure-Python tree.
+
 ```
 crates/fieldloop-py/
-├── Cargo.toml          # cdylib crate; deps: pyo3, fieldloop-capture, fieldloop-types
-├── pyproject.toml      # maturin build backend + uv project (pytest/ruff dev deps)
-├── src/lib.rs          # the PyO3 binding: one `Capture` class, module `fieldloop`
-├── tests/
-│   └── test_capture.py # pytest closed-loop suite (built + run by `uv run pytest`)
-└── README.md
+├── Cargo.toml          # cdylib crate `_native`; deps: pyo3, fieldloop-capture, -types, -join, -config, -curation, -trigger
+├── pyproject.toml      # maturin backend (mixed layout) + the `fieldloop` console script
+├── src/                # the PyO3 binding: the `Capture` class + attribute/curate/select_uploads
+├── python/fieldloop/
+│   ├── __init__.py     # re-exports the public API from the compiled `_native` module
+│   ├── _native.pyi     # type stubs for the compiled module (the public surface)
+│   ├── _cli.py         # the `fieldloop` command (demo/init/attribute/curate)
+│   ├── _demo.py        # the bundled toy-data loop (also backs `fieldloop demo`)
+│   └── data/           # the packaged embodiment sample config (`fieldloop init`)
+├── examples/loop.py    # the loop as a hackable script
+└── tests/              # pytest closed-loop suite (built + run by `uv run pytest`)
 ```
 
-The compiled crate **is** the importable `fieldloop` module (its `[lib] name` and
-`#[pymodule]` are both `fieldloop`), so there is no separate Python source tree.
+The compiled crate is the internal `fieldloop._native` module; callers never import it
+directly — the package `__init__` re-exports the whole API, so `import fieldloop` is
+the stable surface. The underscore name lets the package carry the CLI and demo without
+the Rust crate owning them.
 
-## API
+## The `fieldloop` command
 
-`fieldloop.Capture(tenant_id: str, robot_id: str, capacity: int)`
+Installed as a console script with the wheel (`uv build --wheel` produces a
+`pip install`-able wheel that runs with no Rust toolchain present):
+
+```bash
+fieldloop demo                 # the bundled loop, end to end (--json for stable counts)
+fieldloop init                 # scaffold an embodiment config to edit
+fieldloop attribute --config c.toml --rollouts r.jsonl --outcomes o.jsonl --out fb.jsonl
+fieldloop curate --rollouts r.jsonl --feedbacks fb.jsonl --out slice.json
+```
+
+`attribute` and `curate` read JSON Lines (one dict per line — the exact shapes the
+in-process API takes), so any logging stack can feed them with a few lines of glue.
+Exit codes are scriptable: `0` success, `1` the engine rejected the inputs, `2` the
+files were unreadable or unwritable.
+
+## The library API
+
+`fieldloop.Capture(tenant_id: str, robot_id: str, capacity: int)` — on-robot capture:
 
 - `.register_context(policy_version, model_hash, embodiment, task_id) -> int` —
   register the slowly-changing context once (off the hot path); returns an integer
@@ -34,11 +60,15 @@ The compiled crate **is** the importable `fieldloop` module (its `[lib] name` an
   full queue the record is dropped-and-counted but the id is still returned. Raises
   `ValueError` on a bad `episode_id` or unknown `ctx`.
 - `.dropped() -> int` — count of records dropped because the queue was full.
-- `.drain() -> list[dict]` — drain buffered records into flat dicts with keys
-  `rollout_id`, `episode_id`, `policy_version`, `embodiment`, `task_id`, `step_index`,
-  `mono_ns`, `inference_us`.
+- `.drain() -> list[dict]` — drain buffered records into flat dicts (keys include
+  `rollout_id`, `tenant_id`, `robot_id`, `boot_id`, `episode_id`, `policy_version`,
+  `model_hash`, `embodiment`, `task_id`, `step_index`, `mono_ns`, `wall_ns`,
+  `inference_us`), shaped to feed straight into `attribute`.
 
-### Usage
+Module functions: `attribute(config_toml, rollouts, outcomes)` (bind delayed outcomes
+to decisions, with method + a scored confidence), `curate(spec, rollouts, feedbacks)`
+(compile a training slice; weak evidence is held for review), and
+`select_uploads(rollouts, outcomes, max_requests=...)` (budgeted payload selection).
 
 ```python
 import uuid, fieldloop

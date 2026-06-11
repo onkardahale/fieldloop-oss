@@ -22,6 +22,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use fieldloop_types::Rollout;
+
 pub mod batch;
 pub use batch::{UploadedBlob, build_ingest_request_json, sha256_hex};
 
@@ -258,6 +260,15 @@ impl FileSource for DirSource {
             if !self.is_quiet(mtime, now) {
                 continue;
             }
+            // Defense in depth against uploading a torn file: a finalized MCAP ends with
+            // the MCAP end magic. A file that is quiet (mtime-stable) but lacks the end
+            // magic is a crash-torn leftover, not a finished recording — skip it rather
+            // than ship a truncated file. (The recorder's `.part`->rename finalize already
+            // keeps torn files out of the `.mcap` namespace; this also covers files from a
+            // recorder predating that change, and a crash between footer write and rename.)
+            if !has_mcap_end_magic(&path) {
+                continue;
+            }
             out.push(FoundFile {
                 path,
                 class,
@@ -266,6 +277,41 @@ impl FileSource for DirSource {
         }
         out
     }
+}
+
+/// The 8-byte MCAP magic that bookends a valid file. A finalized MCAP ends with these
+/// exact bytes after its footer, so their presence at end-of-file is a cheap, reliable
+/// "the writer finished this file" signal.
+const MCAP_MAGIC: [u8; 8] = [0x89, b'M', b'C', b'A', b'P', 0x30, b'\r', b'\n'];
+
+/// Whether the file at `path` ends with the MCAP magic — i.e. was fully written and
+/// finalized, not torn off mid-write by a crash.
+///
+/// Reads only the last 8 bytes (one `seek` + one `read`), so it is cheap even for a
+/// multi-GB recording. A file shorter than the magic, or unreadable, or whose tail does
+/// not match, is treated as not-finished so a torn leftover is never uploaded.
+fn has_mcap_end_magic(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    if len < MCAP_MAGIC.len() as u64 {
+        return false;
+    }
+    if file
+        .seek(SeekFrom::End(-(MCAP_MAGIC.len() as i64)))
+        .is_err()
+    {
+        return false;
+    }
+    let mut tail = [0u8; 8];
+    if file.read_exact(&mut tail).is_err() {
+        return false;
+    }
+    tail == MCAP_MAGIC
 }
 
 /// Upload state of a single file in the persisted manifest.
@@ -333,6 +379,108 @@ impl Manifest {
         // agent) ever sees either the old complete manifest or the new complete
         // one, never a torn write.
         fs::rename(&tmp, path)
+    }
+}
+
+/// Tracks how far the agent has registered the append-only rollouts file, so each pass
+/// POSTs only the NEW lines as one delta batch.
+///
+/// Without this the agent re-read the whole growing `rollouts.jsonl` every pass and hashed
+/// ALL ids into a fresh `batch_id`: because the set grows between passes, every pass minted
+/// a new batch id over an overlapping set, the gateway's `(tenant, batch_id)` idempotency
+/// gate saw a "new" batch each time, and ClickHouse (a plain append table) recorded the
+/// same rollouts again and again. Anchoring on a persisted byte offset makes a pass POST
+/// exactly the rollouts appended since the last acked offset; a retry before the offset
+/// advances re-sends the identical delta under the identical `batch_id`, so the gateway
+/// dedups it instead of double-recording.
+pub struct RolloutCheckpoint {
+    /// The sidecar file holding the last acked byte offset, next to the upload manifest.
+    offset_path: PathBuf,
+    /// Bytes of `rollouts.jsonl` already registered (and acked by the gateway).
+    offset: u64,
+}
+
+impl RolloutCheckpoint {
+    /// Load the checkpoint from `state_dir`, starting at offset 0 if none exists yet.
+    ///
+    /// A missing or unparseable offset file reads as 0 (register from the start) rather
+    /// than erroring: 0 is the safe default — at worst the first batch re-sends rollouts
+    /// the gateway then dedups by `batch_id`, never silent loss.
+    #[must_use]
+    pub fn load(state_dir: &Path) -> RolloutCheckpoint {
+        let offset_path = state_dir.join("rollouts.offset");
+        let offset = fs::read_to_string(&offset_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        RolloutCheckpoint {
+            offset_path,
+            offset,
+        }
+    }
+
+    /// The byte offset registered so far.
+    #[must_use]
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Read the rollouts appended to `rollouts_path` since the committed offset, plus the
+    /// new end offset to commit once the gateway acks them.
+    ///
+    /// Only COMPLETE lines (up to the last newline) are consumed; a trailing partial line —
+    /// capture mid-write — is left for a later pass so a half-written rollout is never
+    /// parsed. A missing file, or an offset at/after end (nothing appended, or the file was
+    /// rotated away), yields an empty delta at the unchanged offset. The returned offset is
+    /// NOT applied to `self` — the caller [`Self::commit`]s it only after a successful POST,
+    /// so a crash between POST and commit re-sends the identical delta (idempotent).
+    pub fn read_new(&self, rollouts_path: &Path) -> std::io::Result<(Vec<Rollout>, u64)> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match fs::File::open(rollouts_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), self.offset));
+            }
+            Err(e) => return Err(e),
+        };
+        let len = file.metadata()?.len();
+        if self.offset >= len {
+            // Nothing appended since the last commit (or the file shrank — a rotation we do
+            // not chase here; the common case is append-only).
+            return Ok((Vec::new(), self.offset));
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut tail = String::new();
+        file.read_to_string(&mut tail)?;
+        let Some(last_nl) = tail.rfind('\n') else {
+            // Bytes present but no complete line yet (mid-write): consume nothing.
+            return Ok((Vec::new(), self.offset));
+        };
+        let complete = &tail[..=last_nl];
+        let mut rollouts = Vec::new();
+        for line in complete.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let rollout: Rollout = serde_json::from_str(line).map_err(std::io::Error::other)?;
+            rollouts.push(rollout);
+        }
+        let new_offset = self.offset + complete.len() as u64;
+        Ok((rollouts, new_offset))
+    }
+
+    /// Commit `new_offset` durably (temp file + atomic rename, like the manifest), advancing
+    /// the in-memory offset only after the on-disk write lands.
+    ///
+    /// Called only AFTER the gateway acked the delta, so the offset advances past rollouts
+    /// that are safely registered; a crash before this leaves the old offset and the same
+    /// delta re-sends under the same `batch_id`.
+    pub fn commit(&mut self, new_offset: u64) -> std::io::Result<()> {
+        let tmp = self.offset_path.with_extension("offset.tmp");
+        fs::write(&tmp, new_offset.to_string())?;
+        fs::rename(&tmp, &self.offset_path)?;
+        self.offset = new_offset;
+        Ok(())
     }
 }
 
@@ -845,7 +993,9 @@ mod tests {
         // Two files: one we will treat as quiet (old mtime) and one just touched.
         let quiet = dir.path().join("meta-0.mcap");
         let fresh = dir.path().join("sensor-0.mcap");
-        fs::write(&quiet, b"done").unwrap();
+        // A finalized file ends with the MCAP magic; the fresh one is skipped by the
+        // quiet check before the magic check, so its content is irrelevant.
+        write_finished_mcap(&quiet, b"done");
         fs::write(&fresh, b"writing").unwrap();
 
         // Set the quiet file's mtime well into the past, leave the fresh one as
@@ -880,13 +1030,55 @@ mod tests {
         let old = now - Duration::from_secs(3600);
         for name in ["safety-0.mcap", "notes.txt", "unknown-0.mcap"] {
             let p = dir.path().join(name);
-            fs::write(&p, b"x").unwrap();
+            write_finished_mcap(&p, b"x");
             fs::File::open(&p).unwrap().set_modified(old).unwrap();
         }
         let source = DirSource::with_clock(dir.path(), Duration::from_secs(1), move || now);
         let finished = source.finished_files();
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].class, StreamClass::Safety);
+    }
+
+    /// A torn (unfinalized) `.mcap` that is otherwise quiet is NOT uploaded: it lacks the
+    /// MCAP end magic, so the agent treats it as still-being-written rather than shipping
+    /// a truncated recording.
+    #[test]
+    fn dirsource_skips_a_quiet_but_torn_mcap_without_end_magic() {
+        let dir = tempdir().unwrap();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(3600);
+        let torn = dir.path().join("sensor-0.mcap");
+        fs::write(&torn, b"no end magic here").unwrap(); // quiet but unfinalized
+        fs::File::open(&torn).unwrap().set_modified(old).unwrap();
+        let finished_ok = dir.path().join("meta-0.mcap");
+        write_finished_mcap(&finished_ok, b"body");
+        fs::File::open(&finished_ok)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let source = DirSource::with_clock(dir.path(), Duration::from_secs(1), move || now);
+        let names: Vec<String> = source
+            .finished_files()
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"meta-0.mcap".to_string()),
+            "finalized file is uploadable"
+        );
+        assert!(
+            !names.contains(&"sensor-0.mcap".to_string()),
+            "a torn file with no MCAP end magic must not be uploaded"
+        );
+    }
+
+    /// Write `body` followed by the MCAP end magic, so the file looks finalized to the
+    /// agent's torn-file guard.
+    fn write_finished_mcap(path: &Path, body: &[u8]) {
+        let mut bytes = body.to_vec();
+        bytes.extend_from_slice(&MCAP_MAGIC);
+        fs::write(path, bytes).unwrap();
     }
 
     #[test]
@@ -915,5 +1107,157 @@ mod tests {
         let stats = agent.sync_once().unwrap();
         assert_eq!(stats.done, 1);
         assert_eq!(agent.uploader.bytes_for("safety-0.mcap"), body.to_vec());
+    }
+
+    // ---- RolloutCheckpoint: delta batching / idempotency (P0 #1) -------------
+
+    use fieldloop_types::{
+        BootId, BoundedBlob, EpisodeId, MonoClock, PayloadRef, PolicyVersion, RobotId,
+        RobotIdentity, TenantId,
+    };
+
+    /// A minimal rollout for the checkpoint tests, serialized one-per-line the way capture
+    /// flushes them to `rollouts.jsonl`.
+    fn ckpt_rollout(step: u32) -> Rollout {
+        Rollout::new(
+            RobotIdentity::new(TenantId::new("acme"), RobotId::new("r1")),
+            EpisodeId::new(),
+            step,
+            MonoClock {
+                boot_id: BootId::new(),
+                mono_ns: u64::from(step) + 1,
+                ts_wall_ns: 1,
+            },
+            PolicyVersion::new("pol@v1+abc123def456"),
+            "sha256:w".into(),
+            "arm6dof".into(),
+            "pick".into(),
+            PayloadRef::none(),
+            PayloadRef::none(),
+            BoundedBlob::empty(),
+            1,
+        )
+    }
+
+    /// Append rollouts to a JSONL file (create-or-append), one canonical line each, the way
+    /// the capture drain does.
+    fn append_rollouts(path: &Path, rollouts: &[Rollout]) {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for r in rollouts {
+            writeln!(f, "{}", serde_json::to_string(r).unwrap()).unwrap();
+        }
+    }
+
+    /// A missing rollouts file is a clean empty delta at offset 0, not an error.
+    #[test]
+    fn checkpoint_missing_file_is_empty_delta() {
+        let dir = tempdir().unwrap();
+        let ckpt = RolloutCheckpoint::load(dir.path());
+        let (delta, off) = ckpt.read_new(&dir.path().join("rollouts.jsonl")).unwrap();
+        assert!(delta.is_empty());
+        assert_eq!(off, 0);
+    }
+
+    /// The core idempotency property: each pass reads only the rollouts appended since the
+    /// committed offset, so a growing file yields disjoint deltas instead of re-sending the
+    /// whole file (which defeated the gateway's batch-id dedup).
+    #[test]
+    fn checkpoint_reads_only_the_delta_after_commit() {
+        let dir = tempdir().unwrap();
+        let rollouts = dir.path().join("rollouts.jsonl");
+        let mut ckpt = RolloutCheckpoint::load(dir.path());
+
+        // First pass: two rollouts appear.
+        append_rollouts(&rollouts, &[ckpt_rollout(0), ckpt_rollout(1)]);
+        let (delta1, off1) = ckpt.read_new(&rollouts).unwrap();
+        assert_eq!(delta1.len(), 2, "first pass sees both new rollouts");
+        ckpt.commit(off1).unwrap();
+
+        // Second pass after one MORE rollout is appended: only the new one, not all three.
+        append_rollouts(&rollouts, &[ckpt_rollout(2)]);
+        let (delta2, off2) = ckpt.read_new(&rollouts).unwrap();
+        assert_eq!(delta2.len(), 1, "second pass sees only the delta");
+        assert_eq!(delta2[0].step_index, 2);
+        ckpt.commit(off2).unwrap();
+
+        // Nothing new -> empty delta.
+        let (delta3, _) = ckpt.read_new(&rollouts).unwrap();
+        assert!(delta3.is_empty());
+    }
+
+    /// Before a commit, re-reading returns the IDENTICAL delta (so a retried POST reuses the
+    /// same batch id and the gateway dedups it) — the crash-between-POST-and-commit case.
+    #[test]
+    fn checkpoint_reread_before_commit_is_identical() {
+        let dir = tempdir().unwrap();
+        let rollouts = dir.path().join("rollouts.jsonl");
+        let ckpt = RolloutCheckpoint::load(dir.path());
+        append_rollouts(&rollouts, &[ckpt_rollout(0), ckpt_rollout(1)]);
+
+        let (a, off_a) = ckpt.read_new(&rollouts).unwrap();
+        let (b, off_b) = ckpt.read_new(&rollouts).unwrap();
+        assert_eq!(off_a, off_b);
+        let ids_a: Vec<_> = a.iter().map(|r| r.id).collect();
+        let ids_b: Vec<_> = b.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids_a, ids_b,
+            "re-read before commit must be the identical delta"
+        );
+    }
+
+    /// A trailing partial line (capture mid-write, no newline yet) is NOT consumed until its
+    /// newline lands, so a half-serialized rollout is never parsed or registered.
+    #[test]
+    fn checkpoint_excludes_a_partial_trailing_line() {
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let rollouts = dir.path().join("rollouts.jsonl");
+        append_rollouts(&rollouts, &[ckpt_rollout(0)]); // one complete line
+        // Append a partial line with no trailing newline.
+        let mut f = fs::OpenOptions::new().append(true).open(&rollouts).unwrap();
+        write!(f, "{{\"partial\": ").unwrap();
+        drop(f);
+
+        let ckpt = RolloutCheckpoint::load(dir.path());
+        let (delta, _) = ckpt.read_new(&rollouts).unwrap();
+        assert_eq!(delta.len(), 1, "only the one complete line is read");
+    }
+
+    /// A malformed COMPLETE line is a hard error, never a silently-dropped rollout —
+    /// surfacing the parse failure so the pass retries rather than registering a gap.
+    #[test]
+    fn checkpoint_malformed_complete_line_is_an_error() {
+        let dir = tempdir().unwrap();
+        let rollouts = dir.path().join("rollouts.jsonl");
+        fs::write(&rollouts, "{not valid json}\n").unwrap();
+        let ckpt = RolloutCheckpoint::load(dir.path());
+        assert!(ckpt.read_new(&rollouts).is_err());
+    }
+
+    /// The committed offset survives a reload (atomic temp+rename persist), so a restarted
+    /// agent resumes from where it acked rather than re-registering from zero.
+    #[test]
+    fn checkpoint_offset_persists_across_reload() {
+        let dir = tempdir().unwrap();
+        let rollouts = dir.path().join("rollouts.jsonl");
+        append_rollouts(&rollouts, &[ckpt_rollout(0), ckpt_rollout(1)]);
+
+        let mut ckpt = RolloutCheckpoint::load(dir.path());
+        let (_, off) = ckpt.read_new(&rollouts).unwrap();
+        ckpt.commit(off).unwrap();
+
+        // A fresh agent loads the persisted offset and sees no un-registered rollouts.
+        let reloaded = RolloutCheckpoint::load(dir.path());
+        assert_eq!(reloaded.offset(), off);
+        let (delta, _) = reloaded.read_new(&rollouts).unwrap();
+        assert!(
+            delta.is_empty(),
+            "a reloaded checkpoint re-registers nothing already acked"
+        );
     }
 }

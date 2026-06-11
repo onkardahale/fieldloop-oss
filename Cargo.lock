@@ -871,7 +871,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "fieldloop-adapter"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-config",
  "fieldloop-types",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aws-sdk-s3",
  "fieldloop-types",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-capture"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-types",
  "libc",
@@ -905,7 +905,7 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-types",
  "serde",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-curation"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-join",
  "fieldloop-types",
@@ -925,8 +925,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldloop-import"
+version = "0.2.0"
+dependencies = [
+ "fieldloop-types",
+ "mcap",
+ "serde",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "fieldloop-join"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-nats",
  "fieldloop-config",
@@ -941,11 +952,12 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-capture",
  "fieldloop-config",
  "fieldloop-curation",
+ "fieldloop-import",
  "fieldloop-join",
  "fieldloop-trigger",
  "fieldloop-types",
@@ -955,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-recorder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mcap",
  "tempfile",
@@ -963,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-schemaver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-types",
  "serde",
@@ -973,7 +985,7 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-types",
  "reqwest",
@@ -987,14 +999,14 @@ dependencies = [
 
 [[package]]
 name = "fieldloop-trigger"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fieldloop-types",
 ]
 
 [[package]]
 name = "fieldloop-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3287,6 +3299,7 @@ checksum = "d258b83ceec21034727ecee8c382cfa6c3e133699b0742c64571814fb420c9f7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "rand 0.10.1",
  "serde_core",
  "wasm-bindgen",
 ]

@@ -1,8 +1,10 @@
-"""Type stubs for the `fieldloop` extension module.
+"""Type stubs for the compiled `fieldloop._native` extension module.
 
 The runtime module is the compiled Rust crate `fieldloop-py`; these stubs describe its
-public surface for type checkers and editors. They are hand-maintained to match
-`src/lib.rs` (the `Capture` class) and `src/attribute.rs` (the `attribute` function).
+public surface for type checkers and editors (the package `__init__` re-exports this
+whole surface as the public API). They are hand-maintained to match the binding's Rust source: `src/lib.rs` (the
+`Capture` class and the module surface), `src/attribute.rs` (`attribute`),
+`src/curate.rs` (`curate`), and `src/trigger.rs` (`select_uploads`).
 """
 
 from typing import Any, Optional
@@ -45,6 +47,22 @@ class Capture:
         `mono_ns`, `wall_ns`, `episode_id`, `step_index`, `policy_version`,
         `model_hash`, `embodiment`, `task_id`, `inference_us`."""
 
+class Calibrator:
+    """An opaque, fitted confidence calibrator (built by `fit_calibrator`).
+
+    Pass it to `attribute(..., calibrator=...)` so binding confidences reflect observed
+    accuracy instead of the raw recency/coverage score. Construct only via
+    `fit_calibrator`; it has no public attributes."""
+
+def fit_calibrator(
+    feedbacks: list[dict[str, Any]],
+    rollouts: list[dict[str, Any]],
+    min_labels: int = ...,
+) -> Calibrator:
+    """Fit a `Calibrator` from feedback history (curator `manual` labels as ground truth,
+    bucketed per (join_method, embodiment), isotonic). Buckets with fewer than
+    `min_labels` samples stay uncalibrated (identity). Pass the result to `attribute`."""
+
 def attribute(
     config_toml: str,
     rollouts: list[dict[str, Any]],
@@ -53,13 +71,55 @@ def attribute(
     join_version: Optional[str] = ...,
     heartbeat_period_ns: Optional[int] = ...,
     absence_metric_name: Optional[str] = ...,
+    calibrator: Optional[Calibrator] = ...,
 ) -> dict[str, list[dict[str, Any]]]:
     """Attribute outcomes to the rollouts that caused them.
 
     `config_toml` is the embodiment/attribution-window config; `rollouts` and
     `outcomes` are flat dicts (a `heartbeat` outcome_kind routes to the coverage path).
+    With a `calibrator` from `fit_calibrator`, confidences are calibrated; without one,
+    the honest identity default (confidence = raw score) is used.
     Returns `{"feedbacks": [...], "skipped": [...]}`. Raises `ValueError` on an invalid
     config, a malformed id, an unknown outcome kind, or a missing required field.
+    """
+
+def attribute_mcap(
+    config_toml: str,
+    mcap_bytes: bytes,
+    mapping_toml: str,
+    *,
+    join_version: Optional[str] = ...,
+    heartbeat_period_ns: Optional[int] = ...,
+    absence_metric_name: Optional[str] = ...,
+    calibrator: Optional[Calibrator] = ...,
+) -> dict[str, list[dict[str, Any]]]:
+    """Attribute the outcomes in an MCAP file to the decisions that caused them.
+
+    The file-import counterpart to `attribute`: `mcap_bytes` is the raw bytes of an MCAP
+    recording and `mapping_toml` is a topic-mapping TOML (identity constants, a `[clock]`
+    source, and the decision/outcome topic lists). The file is decoded into typed
+    rollouts/outcomes (a `heartbeat` kind routes to the coverage path), then the same
+    engine runs. `config_toml` is the embodiment/attribution-window config; the mapping's
+    `embodiment` must name one present in it. Returns the same
+    `{"feedbacks": [...], "skipped": [...]}` shape. Raises `ValueError` on an invalid
+    config, an invalid mapping, or an undecodable MCAP.
+    """
+
+def doctor(
+    mcap_bytes: bytes,
+    mapping_toml: str,
+    *,
+    clock_skew_threshold_ns: Optional[int] = ...,
+) -> dict[str, Any]:
+    """Check an MCAP file against a topic-mapping before attribution.
+
+    `mcap_bytes` is the raw bytes of an MCAP recording; `mapping_toml` is the topic-mapping
+    TOML. Returns a dict: `ok` (no problems), `clock_skew_threshold_ns`, `missing_topics`
+    (declared in the mapping but absent from the file), `skewed_topics` (source clock
+    diverges from the recorder clock past the threshold), and `topics` (per-topic `topic`,
+    `role`, `message_count`, `log_time_min_ns`, `log_time_max_ns`, `max_clock_skew_ns`).
+    `clock_skew_threshold_ns` overrides the 1-second default. Raises `ValueError` on an
+    invalid mapping or an undecodable MCAP.
     """
 
 def curate(

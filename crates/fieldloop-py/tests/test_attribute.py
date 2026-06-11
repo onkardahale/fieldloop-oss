@@ -96,6 +96,61 @@ def test_temporal_binds_within_window_with_recency_confidence():
     assert result["skipped"] == []
 
 
+def test_fitted_calibrator_threads_through_attribute():
+    """A fitted calibrator built from feedback history can be passed to `attribute`, and
+    the binding it produces carries the fitted calibrator's version tag (proving the
+    fitted curve, not the identity default, was applied) — the OSS surface of the
+    "confidence is calibrated once your labels exist" promise."""
+    boot, ep, rid = _uuid(), _uuid(), _uuid()
+    rollout = _rollout(rid, boot, ep, 1_000_000_000)
+    outcome = dict(
+        tenant_id="acme",
+        robot_id="r7",
+        boot_id=boot,
+        mono_ns=1_100_000_000,
+        outcome_kind="teleop_takeover",
+    )
+
+    # Without a calibrator: identity, so the row carries the config's calibration version.
+    plain = fieldloop.attribute(CONFIG, [rollout], [outcome])
+    assert plain["feedbacks"][0]["calibration_version"] == "test-v1"
+
+    # Build enough confirmed temporal samples (each an inferred temporal binding agreeing
+    # with a manual ground-truth label, same target) to learn the bucket, then fit.
+    feedbacks = []
+    rollouts = []
+    for _ in range(6):
+        r = _rollout(_uuid(), boot, _uuid(), 1_000_000_000)
+        rollouts.append(r)
+        for method in ("temporal", "manual"):
+            feedbacks.append(
+                dict(
+                    feedback_id=_uuid(),
+                    target_id=r["rollout_id"],
+                    target_type="rollout",
+                    tenant_id="acme",
+                    label_kind="terminal_outcome",
+                    metric_name="task_success",
+                    value_type="boolean",
+                    value=False,  # a failure, agreeing across both rows
+                    join_method=method,
+                    join_confidence=0.9 if method == "temporal" else 1.0,
+                    join_version="join-v1",
+                    calibration_version="test-v1",
+                    dedup_key=f"dk:{r['rollout_id']}:{method}",
+                    outcome_ts_ns=1,
+                    credit_weight=1.0,
+                )
+            )
+    cal = fieldloop.fit_calibrator(feedbacks, rollouts, min_labels=4)
+
+    # With the fitted calibrator: the learned bucket applies, so the row is tagged with the
+    # fitted calibrator's version, not the config default.
+    fitted = fieldloop.attribute(CONFIG, [rollout], [outcome], calibrator=cal)
+    assert len(fitted["feedbacks"]) == 1
+    assert fitted["feedbacks"][0]["calibration_version"] == "fitted-v1"
+
+
 def test_outcome_outside_window_does_not_bind():
     """An outcome past the window is recorded as a non-binding, never bound on a guess."""
     boot, ep, rid = _uuid(), _uuid(), _uuid()

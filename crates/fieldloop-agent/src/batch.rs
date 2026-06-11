@@ -76,10 +76,22 @@ pub fn build_ingest_request_json(
 ) -> Value {
     // The recorded MCAP object the rollouts' frames live in. Capture cannot name it (the
     // object key is assigned cloud-side), so the agent supplies it here from the blob it
-    // actually uploaded. The range, however, is each rollout's OWN — taken from the
-    // rollout, never overwritten — so two rollouts in the same object get two different
-    // pointers, not one shared blob pointer.
-    let object = blobs.first();
+    // actually uploaded. The range is each rollout's OWN — taken from the rollout, never
+    // overwritten — so two rollouts in the same object get two different pointers.
+    //
+    // Select the SENSOR-class blob, not `blobs.first()`: an observation is sensor-stream
+    // data, but `meta-0.mcap` sorts before `sensor-0.mcap`, so first() would point every
+    // observation at the metadata file (a corrupt pointer — the range indexes the sensor
+    // stream). With a single sensor file (the common case) this is exact. Pinning WHICH
+    // sensor file holds a rollout's range when several exist (rotation) needs per-file
+    // index coverage the recorder does not yet emit — the scoped coverage-sidecar
+    // follow-up; until then a multi-sensor-file batch points at the first sensor file.
+    let object = blobs
+        .iter()
+        .find(|b| {
+            crate::StreamClass::from_filename(&b.object_key) == Some(crate::StreamClass::Sensor)
+        })
+        .or_else(|| blobs.first());
     let rollout_values: Vec<Value> = rollouts
         .iter()
         .map(|rollout| {
@@ -428,6 +440,35 @@ mod tests {
         assert_ne!(
             obs0["range"], obs1["range"],
             "two rollouts must not share one blob range"
+        );
+    }
+
+    /// The observation pointer names the SENSOR-class object even when a metadata blob
+    /// sorts ahead of it — the regression where `blobs.first()` pointed every observation
+    /// at `meta-0.mcap` (its range indexes the sensor stream, so a meta-file pointer is
+    /// corrupt).
+    #[test]
+    fn observation_points_at_sensor_blob_not_the_first_sorted() {
+        use fieldloop_types::ByteRange;
+        let r = rollout_with_range(0, Some(ByteRange { start: 0, end: 2 }));
+        // done_keys yields keys in lexicographic order: meta-0 precedes sensor-0.
+        let blobs = vec![
+            UploadedBlob {
+                object_key: "meta-0.mcap".into(),
+                content_sha256: sha256_hex(b"meta"),
+                size: 4,
+            },
+            UploadedBlob {
+                object_key: "sensor-0.mcap".into(),
+                content_sha256: sha256_hex(b"sensor"),
+                size: 6,
+            },
+        ];
+        let v = build_ingest_request_json("acme", "r1", "batch-1", &[r], &blobs);
+        assert_eq!(
+            v["rollouts"][0]["observation_ref"]["object_key"],
+            serde_json::json!("sensor-0.mcap"),
+            "an observation must point at the sensor object, not the meta file that sorts first"
         );
     }
 

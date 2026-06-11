@@ -31,6 +31,8 @@ def test_loop_example_matches_the_documented_first_run():
         "attribute": {"feedbacks": 3, "skipped": 0},
         "curate": {"accepted": 2, "needs_review": 1},
         "select_uploads": {"selected": 1, "dropped": 2},
+        # The same engine run once more on the bundled real MCAP file.
+        "mcap_demo": {"attributed": 4, "unattributed": 1},
     }
 
 
@@ -43,7 +45,7 @@ def test_loop_example_reconstructs_links_and_fails_closed():
     feedbacks = result["attribute"]["feedbacks"]
     methods = sorted(fb["join_method"] for fb in feedbacks)
     assert methods == ["explicit", "temporal", "temporal"]
-    # Every binding carries a calibrated confidence in [0, 1].
+    # Every binding carries a scored confidence in [0, 1].
     assert all(0.0 <= fb["join_confidence"] <= 1.0 for fb in feedbacks)
 
     # Fail-closed: the sub-threshold binding is held out, with the honest reason.

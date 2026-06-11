@@ -1,12 +1,13 @@
 # Concepts
 
-Fieldloop closes a loop around a deployed robot policy: it ties each decision the policy made to the
-real-world outcome it caused, turns failures into replayable evidence, and gates the next version on
-proving it is safer before it can reach a robot.
+FieldLoop ties each decision a deployed policy made to the real-world outcome it caused. Failures
+become replayable evidence. Each version is gated on proving it is safer before reaching a robot.
 
 ```
 capture → join → curate → train → gate → deploy → (repeat)
 ```
+
+The `(repeat)` is the data flywheel: each deployment surfaces new incidents and edge cases that feed the next training cycle.
 
 ## Rollout — a decision
 
@@ -22,13 +23,14 @@ outcome kinds is fixed so analytics share one vocabulary.
 
 ## The join — reconstructing the link
 
-The hard part: nothing attaches an outcome to the decision that caused it. The **attribution
-cascade** reconstructs the link by escalating strategies — explicit reference, temporal proximity
+The hard part: nothing attaches an outcome to the decision that caused it — the failure could
+have happened well before the signal arrives. The **attribution cascade** reconstructs the link by escalating strategies — explicit reference, temporal proximity
 (weighted by recency), spatial co-location, causal chain, and *synthetic absence* (a window proven
-covered by heartbeats with no adverse outcome is a confident success). Every binding carries a
-**calibrated confidence**, and an inferred binding is never treated as ground truth. The result is a
-typed `Feedback` row: which outcome bound to which rollout, by what method, how sure. See
-`docs/quickstart.md` for this running on in-memory data.
+covered by heartbeats with no adverse outcome is a confident success). Every binding carries an
+**explicit confidence**. The default is the raw recency/coverage score; a calibration curve fit from
+curator-confirmed labels replaces it once enough labels exist. An inferred binding is never treated
+as ground truth. The result is a typed `Feedback` row: which outcome bound to which rollout, by what
+method, how sure. See `docs/quickstart.md` for this on in-memory data.
 
 ## Curate — a frozen dataset
 

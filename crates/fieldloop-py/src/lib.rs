@@ -26,6 +26,7 @@ use fieldloop_types::{EpisodeId, PolicyVersion, RobotId, RobotIdentity, TenantId
 
 mod attribute;
 mod curate;
+mod doctor;
 mod marshal;
 mod trigger;
 
@@ -189,7 +190,13 @@ impl Capture {
     }
 }
 
-/// The `fieldloop` Python module — the import name a caller uses (`import fieldloop`).
+/// The compiled core of the `fieldloop` package, imported as `fieldloop._native`.
+///
+/// Callers never import this name directly: the package `__init__` re-exports the
+/// whole surface, so `import fieldloop` keeps working unchanged. The underscore name
+/// marks the compiled module as an implementation detail, which lets the package
+/// layer pure-Python tooling (the `fieldloop` CLI, the demo scenario) around the Rust
+/// core without the Rust crate owning any of it.
 ///
 /// Surfaces the OSS loop core: the on-robot `Capture` class (the non-blocking hot
 /// path) plus the pure analytic stages as module-level functions — `attribute`
@@ -197,9 +204,13 @@ impl Capture {
 /// `select_uploads` (detection + budgeted selective upload). All behavior lives in the
 /// Rust crates; this module only marshals values across the boundary.
 #[pymodule]
-fn fieldloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Capture>()?;
+    m.add_class::<attribute::PyCalibrator>()?;
     m.add_function(wrap_pyfunction!(attribute::attribute, m)?)?;
+    m.add_function(wrap_pyfunction!(attribute::attribute_mcap, m)?)?;
+    m.add_function(wrap_pyfunction!(attribute::fit_calibrator, m)?)?;
+    m.add_function(wrap_pyfunction!(doctor::doctor, m)?)?;
     m.add_function(wrap_pyfunction!(curate::curate, m)?)?;
     m.add_function(wrap_pyfunction!(trigger::select_uploads, m)?)?;
     Ok(())

@@ -9,11 +9,13 @@
 //! high-volume sensor stream backing up against a slow disk cannot delay the tiny safety-critical
 //! e-stop stream, since they share no channel, thread, or file.
 //!
-//! Drop policy is per class:
-//! - [`StreamClass::Sensor`] — bounded, **droppable**: under backpressure it drops-and-counts so the
+//! Drop policy is per class (every class uses a bounded channel; the difference is what a
+//! full buffer means):
+//! - [`StreamClass::Sensor`] — **droppable**: under backpressure it drops-and-counts so the
 //!   producer never blocks behind a slow disk.
-//! - [`StreamClass::Safety`] — **no-drop**: an unbounded channel; a failure to enqueue is a hard
-//!   error, never a routine drop.
+//! - [`StreamClass::Safety`] — **no-drop**: a LARGE bounded buffer; a full buffer (a stalled disk)
+//!   returns a hard [`RecordResult::SafetyBackpressure`] the caller must escalate, never a routine
+//!   drop — and never an unbounded channel that a stall could grow until the process OOMs.
 //! - [`StreamClass::Meta`] — bounded (generously) and droppable; metadata is important but recoverable.
 //!
 //! Files rotate deterministically (by message count and/or elapsed time) into `<class>-<seq>.mcap`,
@@ -24,8 +26,8 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -51,10 +53,11 @@ pub enum StreamClass {
     Sensor,
     /// E-stops and other safety events.
     ///
-    /// **No-drop**: backed by an unbounded channel so a safety event is never
-    /// silently lost to backpressure. If enqueueing one ever fails (only possible if
-    /// the writer thread has died), that is treated as a hard error and surfaced via
-    /// [`RecordResult`], never counted as a routine drop.
+    /// **No-drop**: backed by a LARGE bounded channel so a safety event is never silently
+    /// dropped to backpressure. If the buffer is ever full (the writer thread stalled on a
+    /// slow disk) enqueueing returns the hard [`RecordResult::SafetyBackpressure`] the
+    /// caller must escalate — never a routine counted drop, and never an unbounded channel
+    /// that a stall could grow without limit until the process OOMs and loses everything.
     Safety,
 }
 
@@ -129,8 +132,10 @@ pub struct ChannelId(u16);
 /// comes first. A `None` disables that trigger.
 #[derive(Debug, Clone)]
 pub struct ClassConfig {
-    /// Bounded channel capacity for this class. Ignored for [`StreamClass::Safety`],
-    /// which always uses an unbounded channel so it cannot drop.
+    /// Bounded channel capacity for this class. For [`StreamClass::Safety`] this is a
+    /// real (large) bound too: it caps the buffer so a disk stall cannot grow it without
+    /// limit, and a full safety buffer returns [`RecordResult::SafetyBackpressure`]
+    /// rather than dropping or OOMing.
     pub capacity: usize,
     /// Rotate to a new MCAP file after this many messages have been written to the
     /// current file. `None` disables the message-count trigger.
@@ -190,13 +195,15 @@ impl RecorderConfig {
 
 impl Default for RecorderConfig {
     /// Sensible defaults: a generous `Meta` buffer, a large `Sensor` buffer (it is
-    /// the high-volume, droppable class), and a capacity hint for `Safety` (unused
-    /// there because `Safety` is unbounded). No rotation by default — callers opt in.
+    /// the high-volume, droppable class), and a LARGE `Safety` buffer — now a real bound,
+    /// sized so backpressure only arises under a genuine, sustained disk stall (where an
+    /// unbounded channel would instead grow until OOM). No rotation by default — callers
+    /// opt in.
     fn default() -> RecorderConfig {
         RecorderConfig {
             meta: ClassConfig::new(1024),
             sensor: ClassConfig::new(4096),
-            safety: ClassConfig::new(1024),
+            safety: ClassConfig::new(8192),
         }
     }
 }
@@ -261,6 +268,13 @@ pub enum RecordResult {
     /// A droppable class was at capacity, so the message was dropped and the class's
     /// dropped counter incremented. Only `Meta` and `Sensor` can report this.
     Dropped,
+    /// The no-drop [`StreamClass::Safety`] class's bounded buffer was full (the writer
+    /// thread is not draining fast enough — a stalled disk), so this safety event was NOT
+    /// recorded. Unlike [`RecordResult::Dropped`] this is a HARD error the caller MUST
+    /// escalate (the buffer is bounded precisely so a disk stall cannot grow it without
+    /// limit and OOM the process, which would lose every queued safety event at once);
+    /// it is never a routine, silently-counted drop.
+    SafetyBackpressure,
     /// The writer thread for this class is gone (it panicked or the recorder was
     /// finalized). For [`StreamClass::Safety`] this is a hard error a caller should
     /// escalate, since a safety event was not recorded.
@@ -274,7 +288,9 @@ impl RecordResult {
     pub fn message_index(self) -> Option<MessageIndex> {
         match self {
             RecordResult::Enqueued(index) => Some(index),
-            RecordResult::Dropped | RecordResult::WriterGone => None,
+            RecordResult::Dropped | RecordResult::SafetyBackpressure | RecordResult::WriterGone => {
+                None
+            }
         }
     }
 }
@@ -303,10 +319,11 @@ enum WriteCmd {
 
 /// Per-class shared state the producer touches without locking.
 struct ClassShared {
-    /// The non-blocking sender into this class's writer thread. `Bounded` for
-    /// droppable classes (so `try_send` can report `Full`); `Unbounded` for
-    /// `Safety` so it never drops.
-    tx: ClassSender,
+    /// The bounded sender into this class's writer thread. Every class is now bounded
+    /// (a `sync_channel`): droppable classes drop-and-count on `Full`; `Safety` uses a
+    /// large bound and reports [`RecordResult::SafetyBackpressure`] on `Full` rather than
+    /// an unbounded channel that could grow without limit and OOM the process.
+    tx: SyncSender<WriteCmd>,
     /// Count of messages dropped because a droppable class's bounded channel was
     /// full. Atomic so the producer bumps it without a lock. Always zero for
     /// `Safety`.
@@ -321,19 +338,18 @@ struct ClassShared {
     /// the producer side so the locator is available synchronously without a round-trip
     /// to the off-hot-path writer thread.
     next_message_index: AtomicU64,
-}
-
-/// The sender half, bounded for droppable classes and unbounded for `Safety`.
-///
-/// `Safety` must never drop, so it cannot use a fixed-capacity `sync_channel`; an
-/// unbounded `channel` is used instead. Droppable classes use a bounded
-/// `sync_channel` so `try_send` reports `Full` and the producer can drop-and-count.
-enum ClassSender {
-    /// Bounded sender for `Meta` / `Sensor`: `try_send` reports `Full`.
-    Bounded(SyncSender<WriteCmd>),
-    /// Unbounded sender for `Safety`: enqueue cannot fail for capacity reasons, so a
-    /// safety event is never dropped under backpressure.
-    Unbounded(Sender<WriteCmd>),
+    /// `true` while this class's writer thread is writing cleanly. The writer thread
+    /// clears it on the first I/O error (a full disk, a write fault) instead of
+    /// panicking, and the producer reads it in [`Recorder::record`] so a writer that has
+    /// silently failed surfaces as [`RecordResult::WriterGone`] on the next record —
+    /// rather than messages (including safety events) vanishing into a dead thread with
+    /// `dropped() == 0` and no signal at all.
+    ///
+    /// A standalone `Arc<AtomicBool>` (not an inline field) precisely so the writer thread
+    /// can hold a clone WITHOUT holding the whole `ClassShared` — if the writer kept the
+    /// `ClassShared` it would keep the channel's sender alive, the receiver would never see
+    /// end-of-stream, and the join at shutdown would hang.
+    healthy: Arc<AtomicBool>,
 }
 
 /// The recorder front half, held by the producer near the control loop.
@@ -378,26 +394,25 @@ impl Recorder {
 
         for class in StreamClass::ALL {
             let class_cfg = config.for_class(class).clone();
-            // Build the right channel kind for this class's drop policy.
-            let (sender, receiver) = match class {
-                // Safety must never drop, so it gets an unbounded channel.
-                StreamClass::Safety => {
-                    let (tx, rx) = channel::<WriteCmd>();
-                    (ClassSender::Unbounded(tx), ClassReceiver::Unbounded(rx))
-                }
-                // Droppable classes get a bounded channel so try_send can report Full.
-                StreamClass::Meta | StreamClass::Sensor => {
-                    let (tx, rx) = sync_channel::<WriteCmd>(class_cfg.capacity);
-                    (ClassSender::Bounded(tx), ClassReceiver::Bounded(rx))
-                }
-            };
+            // Every class uses a BOUNDED channel. Droppable classes (`Meta`/`Sensor`)
+            // drop-and-count on `Full`; `Safety` uses a large bound and reports
+            // `SafetyBackpressure` on `Full` instead of an unbounded channel that a disk
+            // stall could grow without limit until the process OOMs (losing every queued
+            // safety event at once — strictly worse than a bounded, loud failure).
+            let (sender, receiver) = sync_channel::<WriteCmd>(class_cfg.capacity);
 
+            // The health flag is shared with the writer thread directly (NOT via the whole
+            // ClassShared, which holds the sender — sharing that would keep the channel
+            // open and hang the shutdown join).
+            let healthy = Arc::new(AtomicBool::new(true));
+            let writer_health = Arc::clone(&healthy);
             shared.push(Arc::new(ClassShared {
                 tx: sender,
                 dropped: AtomicU64::new(0),
                 next_channel_id: AtomicU64::new(1),
                 // The first written message of each class is index 0.
                 next_message_index: AtomicU64::new(0),
+                healthy,
             }));
 
             // Spawn the writer thread. It opens the first MCAP file before doing
@@ -407,7 +422,7 @@ impl Recorder {
             let handle = std::thread::Builder::new()
                 .name(format!("fieldloop-recorder-{}", class.name()))
                 .spawn(move || {
-                    let mut writer = ClassWriter::new(&thread_dir, class, class_cfg)
+                    let mut writer = ClassWriter::new(&thread_dir, class, class_cfg, writer_health)
                         .expect("recorder writer thread failed to open its first MCAP file");
                     writer.run(receiver);
                 })
@@ -459,23 +474,15 @@ impl Recorder {
             message_encoding: message_encoding.to_string(),
             schema,
         };
-        // Registration is a setup-time call, not the hot path, but we still avoid
-        // blocking: for a bounded class a full queue means the registration is
-        // dropped-and-counted like any message (the writer will reject later messages
-        // for an unknown channel, which is the correct loud failure). Safety never
-        // drops.
-        match &shared.tx {
-            ClassSender::Bounded(tx) => {
-                if let Err(TrySendError::Full(_)) = tx.try_send(cmd) {
-                    shared.dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            ClassSender::Unbounded(tx) => {
-                // Send only fails if the writer thread is gone; nothing we can do here
-                // but let later records surface WriterGone.
-                let _ = tx.send(cmd);
-            }
-        }
+        // Registration is a setup-time call, OFF the hot path, so it uses a BLOCKING
+        // `send` (not `try_send`): a dropped registration would mean the channel is never
+        // declared in the file, and the writer thread then skips every later message for
+        // that channel — silently shifting all subsequent message indices and corrupting
+        // each rollout's recorded range. Blocking here (it may briefly wait for the writer
+        // to make space) is acceptable precisely because this is not the control loop;
+        // losing the declaration is not. A `send` error only means the writer thread is
+        // gone, which later records surface as `WriterGone`.
+        let _ = shared.tx.send(cmd);
         ChannelId(channel_id)
     }
 
@@ -505,34 +512,39 @@ impl Recorder {
         data: &[u8],
     ) -> RecordResult {
         let shared = &self.shared[Self::class_index(class)];
+        // A writer thread that hit an I/O error clears `healthy` instead of panicking, so
+        // surface it here: a failed writer is reported as gone rather than letting the
+        // message (a safety event included) disappear into a dead thread with no signal.
+        if !shared.healthy.load(Ordering::Acquire) {
+            return RecordResult::WriterGone;
+        }
         let cmd = WriteCmd::Message {
             channel_id: channel.0,
             log_time_ns,
             // Copy now so the producer owns its buffer again as soon as we return.
             data: data.to_vec(),
         };
-        match &shared.tx {
-            ClassSender::Bounded(tx) => match tx.try_send(cmd) {
-                // Assign the message index only after a successful enqueue, so a message
-                // that goes on to be written claims index N and a dropped one below never
-                // does — the indices match the writer thread's write order exactly.
-                Ok(()) => RecordResult::Enqueued(Self::next_index(shared)),
-                // Full: droppable class under backpressure — drop and count, never
-                // block. This is the property that keeps the producer off the disk.
-                Err(TrySendError::Full(_)) => {
+        // Non-blocking `try_send` on every class: the producer must never wait on the
+        // disk. The Full arm differs by drop policy.
+        match shared.tx.try_send(cmd) {
+            // Assign the message index only after a successful enqueue, so a message that
+            // goes on to be written claims index N and a dropped one below never does —
+            // the indices match the writer thread's write order exactly.
+            Ok(()) => RecordResult::Enqueued(Self::next_index(shared)),
+            Err(TrySendError::Full(_)) => {
+                if class.is_droppable() {
+                    // Droppable class under backpressure — drop and count, never block.
                     shared.dropped.fetch_add(1, Ordering::Relaxed);
                     RecordResult::Dropped
+                } else {
+                    // Safety's bounded buffer is full (a stalled disk). Report it as a
+                    // HARD error the caller must escalate, never a silent drop and never
+                    // an unbounded RAM grow that would OOM the process.
+                    RecordResult::SafetyBackpressure
                 }
-                // Disconnected: the writer thread is gone.
-                Err(TrySendError::Disconnected(_)) => RecordResult::WriterGone,
-            },
-            ClassSender::Unbounded(tx) => match tx.send(cmd) {
-                // Unbounded send only fails if the receiver (writer thread) is gone.
-                // It cannot fail for capacity, which is exactly why Safety never
-                // drops under backpressure.
-                Ok(()) => RecordResult::Enqueued(Self::next_index(shared)),
-                Err(_) => RecordResult::WriterGone,
-            },
+            }
+            // Disconnected: the writer thread is gone.
+            Err(TrySendError::Disconnected(_)) => RecordResult::WriterGone,
         }
     }
 
@@ -548,8 +560,9 @@ impl Recorder {
 
     /// Number of messages dropped on a class because its bounded queue was full.
     ///
-    /// Always zero for [`StreamClass::Safety`] (it is unbounded and cannot drop). A
-    /// rising count on `Sensor`/`Meta` means the disk is not keeping up with the
+    /// Always zero for [`StreamClass::Safety`]: it is no-drop, so backpressure surfaces
+    /// as the [`RecordResult::SafetyBackpressure`] return value, never as a silent counted
+    /// drop. A rising count on `Sensor`/`Meta` means the disk is not keeping up with the
     /// producer — useful operational telemetry.
     #[must_use]
     pub fn dropped(&self, class: StreamClass) -> u64 {
@@ -591,10 +604,11 @@ impl Recorder {
             let (tx, rx) = sync_channel::<WriteCmd>(0);
             drop(rx);
             *slot = Arc::new(ClassShared {
-                tx: ClassSender::Bounded(tx),
+                tx,
                 dropped: AtomicU64::new(0),
                 next_channel_id: AtomicU64::new(1),
                 next_message_index: AtomicU64::new(0),
+                healthy: Arc::new(AtomicBool::new(true)),
             });
         }
         // Now that the original senders are dropped, each writer thread's receiver
@@ -621,24 +635,6 @@ impl Drop for Recorder {
     }
 }
 
-/// The receiver half handed to a writer thread, matching its class's channel kind.
-enum ClassReceiver {
-    /// Bounded receiver for droppable classes.
-    Bounded(Receiver<WriteCmd>),
-    /// Unbounded receiver for `Safety`.
-    Unbounded(Receiver<WriteCmd>),
-}
-
-impl ClassReceiver {
-    /// Block for the next command, returning `None` once all senders are dropped
-    /// (end-of-stream), which is the writer thread's signal to finalize and exit.
-    fn recv(&self) -> Option<WriteCmd> {
-        match self {
-            ClassReceiver::Bounded(rx) | ClassReceiver::Unbounded(rx) => rx.recv().ok(),
-        }
-    }
-}
-
 /// The off-hot-path writer for one class. Owns the `mcap::Writer`, the current file's
 /// sequence number and counters, and the rotation policy. Lives entirely on the
 /// class's writer thread — the producer never touches any of this.
@@ -653,11 +649,20 @@ struct ClassWriter {
     /// rotation so files are predictably named and ordered.
     file_seq: u64,
     /// The live MCAP writer for the current file, plus the bookkeeping needed to map
-    /// the producer's `ChannelId`s onto MCAP channel ids in *this* file.
-    state: OpenFile,
+    /// the producer's `ChannelId`s onto MCAP channel ids in *this* file. An `Option` only
+    /// so finalizing (which consumes the `OpenFile` to fsync+rename) can `take()` it; it
+    /// is `Some` for the whole operating life of the writer between create and the final
+    /// finish.
+    state: Option<OpenFile>,
     /// Channel declarations seen so far, replayed into each new file after a rotation
     /// so a topic recorded across a rotation appears in every file it spans.
     declarations: BTreeMap<u16, ChannelDecl>,
+    /// Shared health flag (the producer reads the same `Arc<AtomicBool>`); this thread
+    /// clears it on an I/O error so the producer's next [`Recorder::record`] surfaces the
+    /// failure instead of writing into a silently-dead thread. Just the flag, not the
+    /// whole `ClassShared` — holding the latter would keep the channel sender alive and
+    /// hang the shutdown join.
+    health: Arc<AtomicBool>,
 }
 
 /// A remembered channel declaration, kept so it can be re-applied to the next file
@@ -672,6 +677,13 @@ struct ChannelDecl {
 struct OpenFile {
     /// The MCAP writer wrapping a buffered file handle.
     writer: mcap::Writer<BufWriter<File>>,
+    /// The temp path being written (`<class>-<seq>.mcap.part`). A reader/agent never
+    /// sees this name as a finished file; it is renamed to `final_path` only after the
+    /// footer is written and the bytes are fsynced.
+    part_path: PathBuf,
+    /// The final path the temp file is atomically renamed to once finalized
+    /// (`<class>-<seq>.mcap`), so any observer sees only a complete, fsynced file.
+    final_path: PathBuf,
     /// Maps the producer's stable `ChannelId` to the MCAP channel id assigned in this
     /// specific file (channel ids are per-file in MCAP).
     mcap_channel_ids: BTreeMap<u16, u16>,
@@ -686,23 +698,46 @@ struct OpenFile {
 
 impl ClassWriter {
     /// Open the first file for this class and build its writer state.
-    fn new(dir: &Path, class: StreamClass, config: ClassConfig) -> std::io::Result<ClassWriter> {
+    fn new(
+        dir: &Path,
+        class: StreamClass,
+        config: ClassConfig,
+        health: Arc<AtomicBool>,
+    ) -> std::io::Result<ClassWriter> {
         let state = OpenFile::create(dir, class, 0)?;
         Ok(ClassWriter {
             dir: dir.to_path_buf(),
             class,
             config,
             file_seq: 0,
-            state,
+            state: Some(state),
             declarations: BTreeMap::new(),
+            health,
         })
+    }
+
+    /// Record that this class's writer hit an unrecoverable I/O error: clear the shared
+    /// `healthy` flag (so the producer's next `record` returns `WriterGone`) and log it
+    /// once. The thread keeps draining its channel so the producer never blocks, but it
+    /// no longer pretends to be recording.
+    fn mark_unhealthy(&self, what: &str, err: &std::io::Error) {
+        // Only log on the first transition so a persistent failure does not spam.
+        if self.health.swap(false, Ordering::Release) {
+            eprintln!(
+                "fieldloop-recorder: {} writer failed ({what}: {err}); marking the class \
+                 unhealthy — further records report WriterGone",
+                self.class.name()
+            );
+        }
     }
 
     /// The writer thread's main loop: drain commands until end-of-stream, then
     /// finalize the current file. Receiving `None` means the producer's senders were
     /// all dropped, which is the cue to write the MCAP footer/summary and exit.
-    fn run(&mut self, receiver: ClassReceiver) {
-        while let Some(cmd) = receiver.recv() {
+    fn run(&mut self, receiver: Receiver<WriteCmd>) {
+        // `recv()` blocks for the next command and returns `Err` once every sender is
+        // dropped (end-of-stream) — the cue to finalize the current file and exit.
+        while let Ok(cmd) = receiver.recv() {
             match cmd {
                 WriteCmd::Register {
                     channel_id,
@@ -740,7 +775,9 @@ impl ClassWriter {
         };
         // Declare it in the current file now, and remember it so it can be replayed
         // into any file created by a future rotation.
-        self.state.declare(channel_id, &decl);
+        if let Err(e) = self.open_mut().declare(channel_id, &decl) {
+            self.mark_unhealthy("declare", &e);
+        }
         self.declarations.insert(channel_id, decl);
     }
 
@@ -749,19 +786,32 @@ impl ClassWriter {
         if self.should_rotate() {
             self.rotate();
         }
-        self.state.write_message(channel_id, log_time_ns, data);
+        if let Err(e) = self.open_mut().write_message(channel_id, log_time_ns, data) {
+            self.mark_unhealthy("write", &e);
+        }
+    }
+
+    /// The current open file. `Some` for the whole operating life between create and the
+    /// final finish, so a missing one is a recorder bug, not a runtime condition.
+    fn open_mut(&mut self) -> &mut OpenFile {
+        self.state
+            .as_mut()
+            .expect("recorder has no open file mid-operation")
     }
 
     /// Whether the current file has reached a rotation trigger (message count or
     /// elapsed time). Either trigger firing rotates; both being `None` never rotates.
     fn should_rotate(&self) -> bool {
+        let Some(state) = self.state.as_ref() else {
+            return false;
+        };
         if let Some(max) = self.config.max_messages_per_file
-            && self.state.messages_in_file >= max
+            && state.messages_in_file >= max
         {
             return true;
         }
         if let Some(max) = self.config.max_file_duration
-            && self.state.opened_at.elapsed() >= max
+            && state.opened_at.elapsed() >= max
         {
             return true;
         }
@@ -771,7 +821,8 @@ impl ClassWriter {
     /// Finalize the current file and open the next one, replaying all known channel
     /// declarations into it so topics that span a rotation appear in every file.
     fn rotate(&mut self) {
-        self.finish_current_file();
+        // Open the next file FIRST, so a failure to create it leaves the current file
+        // still open and recording rather than dropping messages into the void.
         self.file_seq += 1;
         let mut next = OpenFile::create(&self.dir, self.class, self.file_seq)
             .expect("recorder failed to open the next MCAP file on rotation");
@@ -779,22 +830,40 @@ impl ClassWriter {
         // per-file), so a recorder reading all of a class's files sees the topic in
         // each one it has messages in.
         for (channel_id, decl) in &self.declarations {
-            next.declare(*channel_id, decl);
+            if let Err(e) = next.declare(*channel_id, decl) {
+                self.mark_unhealthy("redeclare", &e);
+            }
         }
-        self.state = next;
+        // Swap in the new file and finalize the old one (footer + fsync + rename).
+        let old = self.state.replace(next);
+        if let Some(old) = old
+            && let Err(e) = old.finish()
+        {
+            self.mark_unhealthy("finalize-on-rotation", &e);
+        }
     }
 
-    /// Finish the current MCAP file: write its footer/summary so it is a valid file.
+    /// Finalize the current MCAP file (footer + fsync + atomic rename), consuming it so
+    /// no further writes are possible. Called at end-of-stream; after it `state` is `None`.
     fn finish_current_file(&mut self) {
-        self.state.finish();
+        if let Some(state) = self.state.take()
+            && let Err(e) = state.finish()
+        {
+            self.mark_unhealthy("finalize", &e);
+        }
     }
 }
 
 impl OpenFile {
-    /// Create and open a fresh MCAP file `<class>-<seq>.mcap` for this class.
+    /// Create and open a fresh MCAP file for this class, writing to a `.part` temp name
+    /// that is published to `<class>-<seq>.mcap` only when [`OpenFile::finish`] fsyncs and
+    /// renames it.
     fn create(dir: &Path, class: StreamClass, seq: u64) -> std::io::Result<OpenFile> {
-        let path = dir.join(format!("{}-{}.mcap", class.name(), seq));
-        let file = File::create(&path)?;
+        let final_path = dir.join(format!("{}-{}.mcap", class.name(), seq));
+        let part_path = dir.join(format!("{}-{}.mcap.part", class.name(), seq));
+        // Write to the temp name so an in-progress (or crash-torn) file never carries the
+        // final name an agent treats as a finished, uploadable recording.
+        let file = File::create(&part_path)?;
         let buf = BufWriter::new(file);
         // Default write options emit chunk/summary records and a footer, which is what
         // makes the file read back as valid, seekable MCAP. The `library` field tags
@@ -805,6 +874,8 @@ impl OpenFile {
             .map_err(std::io::Error::other)?;
         Ok(OpenFile {
             writer,
+            part_path,
+            final_path,
             mcap_channel_ids: BTreeMap::new(),
             mcap_schema_ids: BTreeMap::new(),
             messages_in_file: 0,
@@ -813,8 +884,10 @@ impl OpenFile {
     }
 
     /// Declare a channel (and its optional schema) in this file, recording the MCAP
-    /// channel id so later messages can target it.
-    fn declare(&mut self, channel_id: u16, decl: &ChannelDecl) {
+    /// channel id so later messages can target it. Returns the underlying MCAP write
+    /// error rather than panicking, so the writer thread can mark its class unhealthy
+    /// instead of dying silently.
+    fn declare(&mut self, channel_id: u16, decl: &ChannelDecl) -> std::io::Result<()> {
         // Resolve (or write) the schema first; MCAP requires a channel's schema id to
         // already exist. schema_id 0 means "no schema".
         let schema_id = match &decl.schema {
@@ -827,7 +900,7 @@ impl OpenFile {
                     let id = self
                         .writer
                         .add_schema(&schema.name, &schema.encoding, &schema.data)
-                        .expect("recorder failed to write an MCAP schema record");
+                        .map_err(std::io::Error::other)?;
                     self.mcap_schema_ids.insert(key, id);
                     id
                 }
@@ -841,18 +914,26 @@ impl OpenFile {
                 &decl.message_encoding,
                 &BTreeMap::new(),
             )
-            .expect("recorder failed to write an MCAP channel record");
+            .map_err(std::io::Error::other)?;
         self.mcap_channel_ids.insert(channel_id, mcap_id);
+        Ok(())
     }
 
-    /// Write one message to a previously-declared channel in this file.
-    fn write_message(&mut self, channel_id: u16, log_time_ns: u64, data: &[u8]) {
+    /// Write one message to a previously-declared channel in this file. Returns the MCAP
+    /// write error rather than panicking so the writer thread can escalate it.
+    fn write_message(
+        &mut self,
+        channel_id: u16,
+        log_time_ns: u64,
+        data: &[u8],
+    ) -> std::io::Result<()> {
         let Some(&mcap_id) = self.mcap_channel_ids.get(&channel_id) else {
             // A message for a channel never declared in this file: this only happens
             // if a registration was dropped under backpressure. Skip it loudly rather
-            // than corrupt the file.
+            // than corrupt the file. (Blocking `Register` makes this practically
+            // unreachable now, but skipping stays the safe response.)
             eprintln!("fieldloop-recorder: dropping message for undeclared channel {channel_id}");
-            return;
+            return Ok(());
         };
         let header = mcap::records::MessageHeader {
             channel_id: mcap_id,
@@ -866,17 +947,36 @@ impl OpenFile {
         };
         self.writer
             .write_to_known_channel(&header, data)
-            .expect("recorder failed to write an MCAP message");
+            .map_err(std::io::Error::other)?;
         self.messages_in_file += 1;
+        Ok(())
     }
 
-    /// Write the MCAP footer/summary so the file is valid and seekable, then flush.
-    fn finish(&mut self) {
-        // finish() writes the summary section + footer; without it the file is
-        // truncated and will not read back validly.
-        self.writer
-            .finish()
-            .expect("recorder failed to finalize an MCAP file");
+    /// Finalize durably: write the MCAP footer, flush the buffer to the file, fsync the
+    /// bytes to disk, then atomically rename the `.part` temp to its final name.
+    ///
+    /// Consumes `self` because publishing the file ends its life. The fsync-before-rename
+    /// order is what makes the durability real: on power loss (the normal robot failure
+    /// mode) a file carrying the final name is guaranteed complete and on disk, never a
+    /// torn page-cache leftover an agent would then upload. A failure at any step is
+    /// surfaced (the writer thread escalates it) rather than leaving a half-published file.
+    fn finish(mut self) -> std::io::Result<()> {
+        // finish() writes the summary section + footer; without it the file is truncated
+        // and will not read back validly.
+        self.writer.finish().map_err(std::io::Error::other)?;
+        // Recover the buffered file, flushing any buffered MCAP bytes into the OS file.
+        let buf = self.writer.into_inner();
+        let file = buf
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
+        // fsync the data+metadata so the bytes are on stable storage before we expose the
+        // final name; a rename of an unsynced file could publish an empty file after a
+        // power cut.
+        file.sync_all()?;
+        drop(file);
+        // Atomic on the same filesystem: an observer sees either no final file or the
+        // complete one, never a partial.
+        std::fs::rename(&self.part_path, &self.final_path)
     }
 }
 
@@ -976,41 +1076,73 @@ mod tests {
         );
     }
 
+    /// Durable finalize: after the recorder finalizes, each class's data is published
+    /// under its final `<class>-0.mcap` name and NO `.part` temp remains — so an agent
+    /// that treats every `.mcap` as finished never sees a half-written file, and a torn
+    /// crash leftover keeps the `.part` name (which the agent ignores) instead.
+    #[test]
+    fn finalize_publishes_final_name_and_leaves_no_part_file() {
+        let dir = tempdir().unwrap();
+        let recorder = Recorder::new(dir.path(), RecorderConfig::default());
+        let ch = recorder.register_channel(StreamClass::Sensor, "/sensor/depth", "raw", None);
+        recorder.record(StreamClass::Sensor, ch, 1, b"frame");
+        recorder.finalize();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "sensor-0.mcap"),
+            "the finalized file must carry its final name, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with(".part")),
+            "no .part temp may survive a clean finalize, got {names:?}"
+        );
+    }
+
     #[test]
     fn sensor_drops_and_counts_while_safety_never_drops_under_flood() {
         let dir = tempdir().unwrap();
         // Tiny sensor capacity so a flood overflows it; generous safety config
         // (unbounded regardless). No writer-thread draining is forced, so the bounded
         // sensor channel fills and overflows deterministically.
+        // Tiny sensor capacity so a flood overflows it and drops-and-counts; a LARGE
+        // (but now bounded) safety buffer so a safety event is never silently dropped.
         let config = RecorderConfig {
             meta: ClassConfig::new(1024),
             sensor: ClassConfig::new(2),
-            safety: ClassConfig::new(2),
+            safety: ClassConfig::new(8192),
         };
         let recorder = Recorder::new(dir.path(), config);
 
         let sensor_ch = recorder.register_channel(StreamClass::Sensor, "/sensor/x", "raw", None);
         let safety_ch = recorder.register_channel(StreamClass::Safety, "/safety/x", "raw", None);
 
-        // Flood both classes hard. We can't fully control how fast the writer thread
-        // drains, but with a capacity-2 sensor channel and thousands of sends, drops
-        // are guaranteed; safety must report zero drops no matter what.
+        // Flood both classes hard. With a capacity-2 sensor channel and thousands of
+        // sends the sensor class drops; the safety class must NEVER report a routine
+        // `Dropped` — at worst it loudly back-pressures, and every event it ACCEPTS is
+        // durable (none silently lost).
         let flood = 5000;
         let mut sensor_dropped_seen = false;
+        let mut accepted_safety = 0u64; // safety events the recorder took responsibility for
         for i in 0..flood {
             let payload = (i as u32).to_le_bytes();
-            let r = recorder.record(StreamClass::Sensor, sensor_ch, i, &payload);
-            if r == RecordResult::Dropped {
+            if recorder.record(StreamClass::Sensor, sensor_ch, i, &payload) == RecordResult::Dropped
+            {
                 sensor_dropped_seen = true;
             }
-            let r = recorder.record(StreamClass::Safety, safety_ch, i, &payload);
-            // Safety must never report a drop; only Enqueued (or WriterGone, which
-            // would itself be a test failure). The carried index varies per message, so
-            // match the variant rather than a fixed value.
-            assert!(
-                matches!(r, RecordResult::Enqueued(_)),
-                "safety must never drop"
-            );
+            // Safety is never a routine drop: only Enqueued (accepted) or, if its bounded
+            // buffer is momentarily full, the hard SafetyBackpressure signal — never
+            // Dropped and never WriterGone.
+            match recorder.record(StreamClass::Safety, safety_ch, i, &payload) {
+                RecordResult::Enqueued(_) => accepted_safety += 1,
+                RecordResult::SafetyBackpressure => {}
+                other => {
+                    panic!("safety record must be Enqueued or SafetyBackpressure, got {other:?}")
+                }
+            }
         }
 
         assert!(
@@ -1018,23 +1150,25 @@ mod tests {
             "flooded sensor class must have dropped at least one message"
         );
         assert!(recorder.dropped(StreamClass::Sensor) > 0);
-        // The no-drop class counts zero drops by construction.
+        // The no-drop class never counts a routine drop (backpressure is a loud return
+        // value, not a silent counter).
         assert_eq!(recorder.dropped(StreamClass::Safety), 0);
+        // With an 8192 buffer and a draining writer, every safety event is accepted at
+        // this scale (the common no-backpressure path the bound is sized for).
+        assert_eq!(
+            accepted_safety, flood,
+            "an 8192-deep safety buffer must accept every event at this flood scale"
+        );
 
         recorder.finalize();
 
-        // Every safety message must be recoverable — none lost.
+        // Every ACCEPTED safety event is recoverable — what the recorder took, it kept.
         let safety = read_back(dir.path(), StreamClass::Safety);
         assert_eq!(
-            safety.len(),
-            flood as usize,
-            "no safety message may be lost"
+            safety.len() as u64,
+            accepted_safety,
+            "every accepted safety event must be recoverable — none silently lost"
         );
-        for (i, (topic, log_time, data)) in safety.iter().enumerate() {
-            assert_eq!(topic, "/safety/x");
-            assert_eq!(*log_time, i as u64);
-            assert_eq!(data, &(i as u32).to_le_bytes().to_vec());
-        }
     }
 
     #[test]

@@ -27,7 +27,8 @@ mod runner {
     use std::time::Duration;
 
     use fieldloop_agent::{
-        Agent, DirSource, S3Uploader, UploadedBlob, build_ingest_request_json, sha256_hex,
+        Agent, DirSource, RolloutCheckpoint, S3Uploader, UploadedBlob, build_ingest_request_json,
+        sha256_hex,
     };
     use fieldloop_types::Rollout;
 
@@ -94,36 +95,6 @@ mod runner {
                 robot_id,
             })
         }
-    }
-
-    /// Read the drained rollouts capture flushed to `path`, one canonical-JSON [`Rollout`]
-    /// per non-empty line.
-    ///
-    /// A missing file yields an empty list (no rollouts to register yet is normal on a
-    /// fresh robot), but a present-and-malformed line is a hard error: silently skipping a
-    /// rollout would drop it from ingest, so the binary surfaces the parse failure instead
-    /// of registering a partial batch.
-    fn read_rollouts(path: &Path) -> Result<Vec<Rollout>, String> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("reading rollouts file {}: {e}", path.display())),
-        };
-        let mut rollouts = Vec::new();
-        for (line_no, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let rollout: Rollout = serde_json::from_str(line).map_err(|e| {
-                format!(
-                    "parsing rollout on line {} of {}: {e}",
-                    line_no + 1,
-                    path.display()
-                )
-            })?;
-            rollouts.push(rollout);
-        }
-        Ok(rollouts)
     }
 
     /// Build the gateway's blob claims from only the files the cloud *confirmed* it
@@ -218,6 +189,11 @@ mod runner {
         let mut agent = Agent::new(uploader, source, &cfg.state_dir)
             .map_err(|e| format!("failed to start agent: {e}"))?;
 
+        // Where in the append-only rollouts file the gateway has already acked. A pass
+        // registers only the rollouts appended past this offset, so the growing file is
+        // never re-POSTed wholesale under a churning batch id.
+        let mut checkpoint = RolloutCheckpoint::load(&cfg.state_dir);
+
         // One blocking HTTP client reused across passes (connection pooling).
         let client = reqwest::blocking::Client::builder()
             .build()
@@ -239,20 +215,32 @@ mod runner {
                 Err(e) => eprintln!("fieldloop-agent: sync error (will retry): {e}"),
             }
 
-            // After shipping bytes, register the drained rollouts with the gateway, pointing
-            // each at the blobs the cloud confirmed. Only attempt a POST when there is
-            // something to register, so an idle robot makes no empty calls.
-            match read_rollouts(&cfg.rollouts_path) {
-                Ok(rollouts) if !rollouts.is_empty() => {
+            // After shipping bytes, register only the rollouts appended since the last acked
+            // offset — one delta batch — pointing each at the blobs the cloud confirmed. The
+            // checkpoint advances ONLY after a successful POST, so a crash before the ack
+            // re-sends the identical delta under the identical batch id (the gateway dedups
+            // it) rather than re-POSTing the whole growing file under a new id every pass.
+            match checkpoint.read_new(&cfg.rollouts_path) {
+                Ok((rollouts, new_offset)) if !rollouts.is_empty() => {
                     let blobs = confirmed_blobs(&agent, &cfg.data_dir);
                     let batch_id = batch_id_for(&rollouts);
                     match register_with_gateway(&client, &cfg, &rollouts, &blobs, &batch_id) {
-                        Ok(()) => eprintln!(
-                            "fieldloop-agent: registered {} rollouts ({} blob pointers) as {}",
-                            rollouts.len(),
-                            blobs.len(),
-                            batch_id
-                        ),
+                        Ok(()) => {
+                            eprintln!(
+                                "fieldloop-agent: registered {} rollouts ({} blob pointers) as {}",
+                                rollouts.len(),
+                                blobs.len(),
+                                batch_id
+                            );
+                            // Advance the checkpoint only now the gateway has the batch, so a
+                            // failure above leaves the offset and the delta is retried.
+                            if let Err(e) = checkpoint.commit(new_offset) {
+                                eprintln!(
+                                    "fieldloop-agent: registered batch but failed to persist \
+                                     checkpoint ({e}); the next pass will re-send it (idempotent)"
+                                );
+                            }
+                        }
                         Err(e) => {
                             eprintln!("fieldloop-agent: ingest POST failed (will retry): {e}");
                         }
@@ -295,50 +283,6 @@ mod runner {
                 BoundedBlob::empty(),
                 1,
             )
-        }
-
-        /// The binary's rollout reader round-trips the canonical `Rollout` serde form the
-        /// gateway also decodes: capture flushes one JSON line per rollout, the binary
-        /// reads them back, and a missing file is an empty (not failing) read.
-        #[test]
-        fn reads_drained_rollouts_from_jsonl() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("rollouts.jsonl");
-
-            // Missing file: empty, not an error (a fresh robot has none yet).
-            assert!(read_rollouts(&path).unwrap().is_empty());
-
-            // Write two rollouts as the binary expects capture to flush them, with a blank
-            // line that must be tolerated.
-            let r0 = sample_rollout(0);
-            let r1 = sample_rollout(1);
-            let lines = format!(
-                "{}\n\n{}\n",
-                serde_json::to_string(&r0).unwrap(),
-                serde_json::to_string(&r1).unwrap()
-            );
-            std::fs::write(&path, lines).unwrap();
-
-            let read = read_rollouts(&path).unwrap();
-            assert_eq!(
-                read,
-                vec![r0, r1],
-                "reader must round-trip the drained rollouts"
-            );
-        }
-
-        /// A malformed line is a hard error (never a silently-dropped rollout), naming the
-        /// line so a misconfigured flush is debuggable.
-        #[test]
-        fn malformed_rollout_line_is_an_error() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("rollouts.jsonl");
-            std::fs::write(&path, "{not valid json}\n").unwrap();
-            let err = read_rollouts(&path).unwrap_err();
-            assert!(
-                err.contains("line 1"),
-                "error must name the offending line: {err}"
-            );
         }
 
         /// The binary's wiring assembles a well-formed `/v1/ingest` body from a drained

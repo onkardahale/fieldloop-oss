@@ -98,9 +98,39 @@ jobs:
           name: sdist
           path: crates/fieldloop-py/dist/*.tar.gz
 
+  smoke:
+    name: Smoke-test the wheel (no Rust toolchain)
+    needs: [linux, macos]
+    strategy:
+      matrix:
+        # One smoke per platform we ship a hosted-runner wheel for. The runner has no Rust
+        # toolchain set up, so a pass proves the wheel alone carries the whole demo.
+        include:
+          - { runner: ubuntu-latest, artifact: wheels-linux-x86_64 }
+          - { runner: macos-14, artifact: wheels-macos-aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+      - name: Install into a clean venv and run the demo
+        run: |
+          python -m venv smoke-venv
+          ./smoke-venv/bin/pip install dist/*.whl
+          ./smoke-venv/bin/fieldloop --version
+          # --json asserts the demo actually ran its stages, not just that the
+          # entry point imported.
+          ./smoke-venv/bin/fieldloop demo --json
+
   release:
     name: Attach artifacts to the GitHub Release
-    needs: [linux, macos, windows, sdist]
+    # smoke gates the release: a wheel that cannot run `fieldloop demo` on a clean
+    # machine must never ship.
+    needs: [linux, macos, windows, sdist, smoke]
     runs-on: ubuntu-latest
     # Only a tag push cuts a release; a manual run just exercises the build matrix above.
     if: startsWith(github.ref, 'refs/tags/')

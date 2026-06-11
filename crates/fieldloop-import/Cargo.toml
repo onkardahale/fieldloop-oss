@@ -1,0 +1,25 @@
+[package]
+name = "fieldloop-import"
+description = "Fieldloop MCAP import: turns a recorded MCAP log + a topic-mapping TOML into the typed rollouts and outcomes the attribution engine consumes."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The open robotics log container. We read finalized files with the same Foxglove
+# `mcap` crate the recorder writes them with, so import decodes real MCAP (schemas,
+# channels, chunked messages) rather than guessing at bytes. Pinned to match
+# `fieldloop-recorder` so a file written here reads back there and vice versa.
+mcap = "0.24"
+# The mapping file is TOML (the same config dialect the embodiment config uses), parsed
+# through serde so an invalid mapping fails at load with a field-named error.
+serde = { workspace = true }
+toml = { workspace = true }
+# Typed import errors (bad mapping, undecodable MCAP, malformed id) so the caller can
+# tell a config mistake from a corrupt file.
+thiserror = { workspace = true }
+# The canonical schema types. Import emits real `Rollout`/`OutcomeEvent` values, not
+# loose dicts, so a mis-mapped field is a type error here rather than an engine reject later.
+fieldloop-types = { workspace = true }

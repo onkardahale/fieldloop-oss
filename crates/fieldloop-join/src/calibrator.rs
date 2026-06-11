@@ -83,9 +83,12 @@ impl Calibrator for IdentityCalibrator {
 /// construction.
 #[derive(Debug, Clone)]
 pub struct FittedCalibrator {
-    /// Per `(method, embodiment)`: the fitted curve as sorted `(raw_threshold, confidence)`
-    /// points with non-decreasing confidence. Empty/absent for unlearned buckets.
-    curves: HashMap<(JoinMethod, String), Vec<(f64, f64)>>,
+    /// Per method, then per embodiment: the fitted curve as sorted `(raw_threshold,
+    /// confidence)` points with non-decreasing confidence. Empty/absent for unlearned
+    /// buckets. Nested (`method -> embodiment -> curve`) rather than keyed by a
+    /// `(method, String)` tuple so the per-row `calibrate` lookup borrows the embodiment
+    /// `&str` instead of allocating a `String` on every binding it scores.
+    curves: HashMap<JoinMethod, HashMap<String, Vec<(f64, f64)>>>,
     /// Identifier written onto each row's `calibration_version`, so a confidence is traceable
     /// to the fit that produced it (distinct from the identity default).
     tag: String,
@@ -155,10 +158,13 @@ impl FittedCalibrator {
             }
         }
 
-        let mut curves = HashMap::new();
-        for (bucket, pts) in samples {
+        let mut curves: HashMap<JoinMethod, HashMap<String, Vec<(f64, f64)>>> = HashMap::new();
+        for ((method, embodiment), pts) in samples {
             if pts.len() >= min_labels {
-                curves.insert(bucket, isotonic(pts));
+                curves
+                    .entry(method)
+                    .or_default()
+                    .insert(embodiment, isotonic(pts));
             }
         }
         Self {
@@ -173,7 +179,12 @@ impl Calibrator for FittedCalibrator {
         match method {
             // Known, not inferred: certain by construction, exactly as the identity default.
             JoinMethod::Explicit | JoinMethod::Manual => 1.0,
-            _ => match self.curves.get(&(method, embodiment.to_string())) {
+            // Borrowed two-level lookup: no `String` allocation on the per-row hot path.
+            _ => match self
+                .curves
+                .get(&method)
+                .and_then(|by_embodiment| by_embodiment.get(embodiment))
+            {
                 Some(curve) => eval_isotonic(curve, raw_score.clamp(0.0, 1.0)),
                 // Unlearned bucket: fall back to identity rather than invent a confidence.
                 None => raw_score.clamp(0.0, 1.0),

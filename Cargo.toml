@@ -7,11 +7,14 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/fieldloop-adapter", "crates/fieldloop-agent", "crates/fieldloop-capture", "crates/fieldloop-config", "crates/fieldloop-curation", "crates/fieldloop-join", "crates/fieldloop-py", "crates/fieldloop-recorder", "crates/fieldloop-schemaver", "crates/fieldloop-store", "crates/fieldloop-trigger", "crates/fieldloop-types"]
+members = ["crates/fieldloop-adapter", "crates/fieldloop-agent", "crates/fieldloop-capture", "crates/fieldloop-config", "crates/fieldloop-curation", "crates/fieldloop-import", "crates/fieldloop-join", "crates/fieldloop-py", "crates/fieldloop-recorder", "crates/fieldloop-schemaver", "crates/fieldloop-store", "crates/fieldloop-trigger", "crates/fieldloop-types"]
 
 # Shared package metadata inherited by member crates via `field.workspace = true`.
 [workspace.package]
-version = "0.1.0"
+# 0.2.0: the file-import surface (MCAP import, doctor, view, lerobot) plus core fixes
+# that change persisted/API contracts (dk2 dedup scheme, recorder backpressure variant).
+# Pre-1.0: breaking changes ride MINOR bumps; 1.0.0 waits until the public API is stable.
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["onkardahale"]
@@ -25,8 +28,12 @@ repository = "https://github.com/onkardahale/fieldloop-oss"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # UUIDv7 ids (invariant 2: uniqueness + coarse sort only; embedded ts is advisory).
-# "v7" enables Uuid::now_v7(); "serde" lets ids ride the wire form.
-uuid = { version = "1", features = ["v7", "serde"] }
+# "v7" enables Uuid::now_v7(); "serde" lets ids ride the wire form. "fast-rng" draws the
+# random bits from a thread-local PRNG instead of a `getrandom` syscall per call: ids need
+# uniqueness + coarse time-sortability, NOT cryptographic unpredictability (they are never
+# tokens), so this removes a syscall/scheduling point from the 50Hz capture hot path
+# (`log_step` mints an id every step) at no security cost.
+uuid = { version = "1", features = ["v7", "serde", "fast-rng"] }
 # Ergonomic, derive-based error types for the id parse error (and future crates).
 thiserror = "1"
 # The local schema crate, shared so config can reference the canonical outcome
