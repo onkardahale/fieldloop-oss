@@ -9,6 +9,18 @@ The loop is four calls. Onboarding is: feed them your data instead of the toy da
 capture → attribute → curate → select_uploads
 ```
 
+**Already have MCAP recordings? Skip the capture step.** Point `fieldloop` straight at a
+file with a topic-mapping TOML — no instrumentation required:
+
+```bash
+fieldloop doctor run.mcap --map mapping.toml                        # check topics + clocks
+fieldloop attribute run.mcap --map mapping.toml --config my_robot.toml
+```
+
+The mapping declares which topics are decisions and which are outcomes; see
+[`docs/quickstart.md`](quickstart.md). The rest of this page is the live-capture path, for
+when you want decisions logged off the robot's control loop in real time.
+
 ---
 
 ## Step A — Describe your embodiment
